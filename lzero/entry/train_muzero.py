@@ -17,7 +17,8 @@ from tensorboardX import SummaryWriter
 from lzero.entry.utils import log_buffer_memory_usage, log_buffer_run_time
 from lzero.policy import visit_count_temperature
 from lzero.policy.random_policy import LightZeroRandomPolicy
-from lzero.worker import MuZeroCollector as Collector
+from lzero.worker import MuZeroCollector
+from lzero.worker import MultiActorMuZeroCollector
 from lzero.worker import MuZeroEvaluator as Evaluator
 from .utils import random_collect, calculate_update_per_collect
 
@@ -109,13 +110,30 @@ def train_muzero(
     batch_size = policy_config.batch_size
     # specific game buffer for MCTS+RL algorithms
     replay_buffer = GameBuffer(policy_config)
-    collector = Collector(
-        env=collector_env,
-        policy=policy.collect_mode,
-        tb_logger=tb_logger,
-        exp_name=cfg.exp_name,
-        policy_config=policy_config,
-    )
+    
+    # 根据配置自动选择Collector类型
+    # 如果配置了n_actors且大于1，则使用多Actor并行采集器
+    n_actors = getattr(policy_config, 'n_actors', 1)
+    if n_actors > 1:
+        logging.info(f"使用多Actor并行采集器: n_actors={n_actors}")
+        collector = MultiActorMuZeroCollector(
+            env=collector_env,
+            policy=policy.collect_mode,
+            tb_logger=tb_logger,
+            exp_name=cfg.exp_name,
+            policy_config=policy_config,
+            env_fn=env_fn,                    # 传递环境创建函数
+            env_config=collector_env_cfg,     # 传递环境配置
+        )
+    else:
+        collector = MuZeroCollector(
+            env=collector_env,
+            policy=policy.collect_mode,
+            tb_logger=tb_logger,
+            exp_name=cfg.exp_name,
+            policy_config=policy_config,
+        )
+    
     evaluator = Evaluator(
         eval_freq=cfg.policy.eval_freq,
         n_evaluator_episode=cfg.env.n_evaluator_episode,
