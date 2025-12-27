@@ -829,29 +829,34 @@ class MultiActorMuZeroCollector(ISerialCollector):
                     remaining = self._envs_per_actor - len(actor_env_configs)
                     actor_env_configs.extend(list(self._env_config[:remaining]))
                 
-                # 从原始env复制完整的配置（确保包含所有必要参数）
+                # 构造完整的env_manager配置（兼容不同版本的DI-engine）
+                # 先定义所有可能需要的默认参数
+                default_env_manager_cfg = dict(
+                    type='subprocess',
+                    shared_memory=False,
+                    episode_num=float('inf'),
+                    max_retry=5,
+                    step_timeout=60,
+                    auto_reset=True,
+                    reset_timeout=60,
+                    retry_type='reset',
+                    retry_waiting_time=0.1,
+                    copy_on_get=True,
+                    context='spawn',
+                    wait_num=float('inf'),
+                    connect_timeout=60,
+                )
+                
+                # 如果原始env有配置，用它覆盖默认值
                 if hasattr(self._original_env, '_cfg') and self._original_env._cfg is not None:
-                    env_manager_cfg = copy.deepcopy(self._original_env._cfg)
-                    # 确保type字段存在（创建env_manager时会被pop掉）
-                    if 'type' not in env_manager_cfg:
-                        env_manager_cfg['type'] = 'subprocess'
-                else:
-                    # 使用默认的完整配置
-                    env_manager_cfg = EasyDict(dict(
-                        type='subprocess',
-                        shared_memory=False,
-                        episode_num=float('inf'),
-                        max_retry=5,
-                        step_timeout=60,
-                        auto_reset=True,
-                        reset_timeout=60,
-                        retry_type='reset',
-                        retry_waiting_time=0.1,
-                        copy_on_get=True,
-                        context='spawn',
-                        wait_num=float('inf'),
-                        connect_timeout=60,
-                    ))
+                    # 从原始配置复制已有的值
+                    for key, value in self._original_env._cfg.items():
+                        default_env_manager_cfg[key] = value
+                
+                # 确保type字段存在
+                default_env_manager_cfg['type'] = 'subprocess'
+                
+                env_manager_cfg = EasyDict(default_env_manager_cfg)
                 
                 actor_env = create_env_manager(
                     env_manager_cfg,
