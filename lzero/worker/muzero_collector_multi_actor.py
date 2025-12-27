@@ -720,6 +720,7 @@ class MultiActorMuZeroCollector(ISerialCollector):
         policy_config: 'policy_config' = None,
         env_fn: Callable = None,              # 环境创建函数
         env_config: List[dict] = None,        # 环境配置列表
+        env_manager_cfg: dict = None,         # env_manager完整配置（来自cfg.env.manager）
     ) -> None:
         """
         Args:
@@ -734,6 +735,7 @@ class MultiActorMuZeroCollector(ISerialCollector):
                 - envs_per_actor: 每个Actor管理的环境数量
             env_fn: 环境创建函数
             env_config: 环境配置
+            env_manager_cfg: env_manager的完整配置（直接从cfg.env.manager传入）
         """
         self._exp_name = exp_name
         self._instance_name = instance_name
@@ -777,6 +779,7 @@ class MultiActorMuZeroCollector(ISerialCollector):
         self._env_fn = env_fn
         self._env_config = env_config
         self._original_env = env  # 保留原始env用于获取action_space等信息
+        self._env_manager_cfg = env_manager_cfg  # 保存完整的env_manager配置
         
         # 队列
         self._request_queue: queue.Queue = queue.Queue()
@@ -829,34 +832,22 @@ class MultiActorMuZeroCollector(ISerialCollector):
                     remaining = self._envs_per_actor - len(actor_env_configs)
                     actor_env_configs.extend(list(self._env_config[:remaining]))
                 
-                # 构造完整的env_manager配置（兼容不同版本的DI-engine）
-                # 先定义所有可能需要的默认参数
-                default_env_manager_cfg = dict(
-                    type='subprocess',
-                    shared_memory=False,
-                    episode_num=float('inf'),
-                    max_retry=5,
-                    step_timeout=60,
-                    auto_reset=True,
-                    reset_timeout=60,
-                    retry_type='reset',
-                    retry_waiting_time=0.1,
-                    copy_on_get=True,
-                    context='spawn',
-                    wait_num=float('inf'),
-                    connect_timeout=60,
-                )
+                # 优先使用传入的env_manager配置（最优雅的方式）
+                if self._env_manager_cfg is not None:
+                    # 直接使用用户配置，最可靠
+                    env_manager_cfg = copy.deepcopy(self._env_manager_cfg)
+                    if not isinstance(env_manager_cfg, EasyDict):
+                        env_manager_cfg = EasyDict(env_manager_cfg)
+                else:
+                    # 回退：从原始env复制配置
+                    if hasattr(self._original_env, '_cfg') and self._original_env._cfg is not None:
+                        env_manager_cfg = copy.deepcopy(self._original_env._cfg)
+                    else:
+                        env_manager_cfg = EasyDict()
                 
-                # 如果原始env有配置，用它覆盖默认值
-                if hasattr(self._original_env, '_cfg') and self._original_env._cfg is not None:
-                    # 从原始配置复制已有的值
-                    for key, value in self._original_env._cfg.items():
-                        default_env_manager_cfg[key] = value
-                
-                # 确保type字段存在
-                default_env_manager_cfg['type'] = 'subprocess'
-                
-                env_manager_cfg = EasyDict(default_env_manager_cfg)
+                # 确保type字段存在（创建时会被pop掉）
+                if 'type' not in env_manager_cfg:
+                    env_manager_cfg['type'] = 'subprocess'
                 
                 actor_env = create_env_manager(
                     env_manager_cfg,

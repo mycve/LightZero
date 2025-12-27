@@ -124,6 +124,7 @@ def train_muzero(
             policy_config=policy_config,
             env_fn=env_fn,                    # 传递环境创建函数
             env_config=collector_env_cfg,     # 传递环境配置
+            env_manager_cfg=cfg.env.manager,  # 传递完整的env_manager配置
         )
     else:
         collector = MuZeroCollector(
