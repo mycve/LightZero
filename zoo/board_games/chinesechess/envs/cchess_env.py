@@ -17,6 +17,12 @@ Overview:
     中国象棋环境，封装 cchess 库以适配 LightZero 的 BaseEnv 接口
     中国象棋是一个双人对弈游戏，棋盘为 9x10（9列10行）
     
+    重构版本：
+    - 动作空间从 8100 压缩到 2238（只保留合法移动模式）
+    - 观察空间去除颜色层，使用己方优先编码
+    - 简化环境拷贝，使用 deepcopy
+    - 支持 HTML 回放
+    
 Mode:
     - ``self_play_mode``: 自对弈模式，用于 AlphaZero/MuZero 数据生成
     - ``play_with_bot_mode``: 与内置 bot 对战模式
@@ -36,27 +42,41 @@ from easydict import EasyDict
 from gymnasium import spaces
 
 from . import cchess
+from .action_mapping import (
+    move_to_action as _move_to_action,
+    action_to_move as _action_to_move,
+    ACTION_SPACE_SIZE,
+    MOVE_TO_ACTION,
+)
 
 
 def move_to_action(move: cchess.Move) -> int:
-    """将 Move 对象转换为动作索引"""
-    return move.from_square * 90 + move.to_square
+    """将 Move 对象转换为动作索引（使用压缩映射）"""
+    return _move_to_action(move.from_square, move.to_square)
 
 
 def action_to_move(action: int) -> cchess.Move:
-    """将动作索引转换为 Move 对象"""
-    from_square = action // 90
-    to_square = action % 90
+    """将动作索引转换为 Move 对象（使用压缩映射）"""
+    from_square, to_square = _action_to_move(action)
     return cchess.Move(from_square, to_square)
 
 
 @ENV_REGISTRY.register('cchess')
 class ChineseChessEnv(BaseEnv):
+    """
+    中国象棋环境（重构版）
+    
+    主要特性：
+    - 动作空间：2238（压缩后的合法移动）
+    - 观察空间：(56, 10, 9) = 14层棋子 * 4历史帧，己方优先编码
+    - 固定视角：始终从当前行动方视角观察，己方棋子在前7层
+    """
+    
     config = dict(
         env_id="ChineseChess",
         battle_mode='self_play_mode',
         battle_mode_in_simulation_env='self_play_mode',
-        render_mode=None,  # 'human', 'svg', 'rgb_array'
+        render_mode=None,  # 'human', 'svg', 'html'
         replay_path=None,
         agent_vs_human=False,
         prob_random_agent=0,
@@ -111,7 +131,8 @@ class ChineseChessEnv(BaseEnv):
         self.current_step = 0
         
         # 渲染相关
-        self.frames = []  # 用于保存渲染图像帧
+        self.frames = []  # 用于保存渲染帧
+        self.move_history = []  # 用于 HTML 回放
         
         # 初始化棋盘
         self.board = cchess.Board()
@@ -127,46 +148,51 @@ class ChineseChessEnv(BaseEnv):
         # 预计算：Board 棋子遍历所需的查找表
         self._piece_types = [cchess.PAWN, cchess.ROOK, cchess.KNIGHT, cchess.CANNON, 
                              cchess.ADVISOR, cchess.BISHOP, cchess.KING]
-        self._colors = [cchess.RED, cchess.BLACK]
         
         # 预计算：BitBoard位索引到(row, col)的映射
         self._square_to_coord = np.array([(s // 9, s % 9) for s in range(90)], dtype=np.int32)
 
-    def _get_raw_planes(self) -> np.ndarray:
+    def _get_pieces_planes(self, color: bool) -> np.ndarray:
         """
-        获取当前棋盘的原始平面表示（固定语义：前7层红方，后7层黑方）
-        不包含颜色通道，不进行视角转换
+        获取指定颜色的棋子平面表示
         
-        优化：
-        使用 lookup table 替代 python scan_forward 循环中的重复除法/取模计算
-        虽然 scan_forward 本身在 Python 中循环，但减少了内部计算
+        Args:
+            color: cchess.RED 或 cchess.BLACK
+            
+        Returns:
+            shape (7, 10, 9) 的数组，每层对应一种棋子类型
         """
-        state = np.zeros((14, 10, 9), dtype=np.float32)
-        
-        # 红方棋子 (前7层)
+        planes = np.zeros((7, 10, 9), dtype=np.float32)
         for i, piece_type in enumerate(self._piece_types):
-            mask = self.board.pieces_mask(piece_type, cchess.RED)
-            if mask:
-                # cchess.scan_forward 是 generator，我们手动解开以稍微加速
-                # 或者更简单的：获取所有 set bits
-                # 由于 cchess 库限制，这里还是使用 scan_forward，但后续坐标计算查表
-                for square in cchess.scan_forward(mask):
-                    r, c = self._square_to_coord[square]
-                    state[i, r, c] = 1
-                
-        # 黑方棋子 (后7层)
-        for i, piece_type in enumerate(self._piece_types):
-            mask = self.board.pieces_mask(piece_type, cchess.BLACK)
+            mask = self.board.pieces_mask(piece_type, color)
             if mask:
                 for square in cchess.scan_forward(mask):
                     r, c = self._square_to_coord[square]
-                    state[i + 7, r, c] = 1
-                
-        return state
+                    planes[i, r, c] = 1
+        return planes
+
+    def _get_canonical_planes(self) -> np.ndarray:
+        """
+        获取己方优先编码的棋盘表示（固定视角）
+        
+        始终将当前行动方的棋子放在前7层，对手棋子放在后7层。
+        不再旋转棋盘，也不再添加颜色层。
+        
+        Returns:
+            shape (14, 10, 9) 的数组
+        """
+        if self._current_player == 1:  # 红方行动
+            own_planes = self._get_pieces_planes(cchess.RED)
+            opp_planes = self._get_pieces_planes(cchess.BLACK)
+        else:  # 黑方行动
+            own_planes = self._get_pieces_planes(cchess.BLACK)
+            opp_planes = self._get_pieces_planes(cchess.RED)
+        
+        return np.concatenate([own_planes, opp_planes], axis=0)
 
     def _update_obs_buffer(self):
         """更新观测缓存"""
-        planes = self._get_raw_planes()
+        planes = self._get_canonical_planes()
         self.obs_buffer.append(planes)
 
     def _player_step(self, action: int, flag: str) -> BaseEnvTimestep:
@@ -186,6 +212,15 @@ class ChineseChessEnv(BaseEnv):
         acting_player = self._current_player
         
         move = action_to_move(action)
+        
+        # 记录移动历史（用于 HTML 回放）
+        self.move_history.append({
+            'from': move.from_square,
+            'to': move.to_square,
+            'player': acting_player,
+            'fen': self.board.fen()
+        })
+        
         self.board.push(move)
         
         # 增加步数计数
@@ -207,7 +242,7 @@ class ChineseChessEnv(BaseEnv):
             outcome = None  # 达到最大步数视为平局
         
         if done:
-            # [DEBUG] 详细打印游戏结束原因，排查全和棋问题
+            # [DEBUG] 详细打印游戏结束原因
             termination_reason = outcome.termination if outcome else "MaxSteps/Unknown"
             winner_info = "None"
             if outcome and outcome.winner is not None:
@@ -216,122 +251,91 @@ class ChineseChessEnv(BaseEnv):
             if outcome and outcome.winner is not None:
                 # 有明确的胜者，奖励从执行动作的玩家视角计算
                 if outcome.winner == cchess.RED:
-                    # 红方胜
                     reward_scalar = 1.0 if acting_player == 1 else -1.0
                 else:
-                    # 黑方胜
                     reward_scalar = -1.0 if acting_player == 1 else 1.0
-                logging.info(f"[ENV_DEBUG] Game Won! Winner: {winner_info}, ActingPlayer: {acting_player}, Reward: {reward_scalar}, Reason: {termination_reason}, Steps: {self.current_step}")
+                logging.info(f"[ENV] Game Won! Winner: {winner_info}, ActingPlayer: {acting_player}, "
+                           f"Reward: {reward_scalar}, Reason: {termination_reason}, Steps: {self.current_step}")
             else:
-                # [修改策略] 将重复局面 (FOURFOLD_REPETITION) 判为负，强迫模型进攻
+                # 和棋或特殊情况处理
                 if termination_reason == cchess.Termination.FOURFOLD_REPETITION:
-                     # 判定当前行动方输 (-1)
-                     reward_scalar = -1.0
-                     logging.info(f"[ENV_DEBUG] Game Ended. Reason: {termination_reason}, ActingPlayer: {acting_player} LOSE (Punished), Steps: {self.current_step}")
+                    reward_scalar = -1.0  # 重复局面判负
+                    logging.info(f"[ENV] Repetition! ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
                 elif self.current_step >= self.max_episode_steps:
-                     # [修改策略] 达到最大步数限制，视为行动方超时/无能，直接判负
-                     reward_scalar = -1.0
-                     logging.info(f"[ENV_DEBUG] Game Ended. Reason: MaxSteps({self.max_episode_steps}), ActingPlayer: {acting_player} LOSE (Punished), Steps: {self.current_step}")
+                    reward_scalar = -1.0  # 超时判负
+                    logging.info(f"[ENV] MaxSteps! ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
                 else:
-                     # 其他和棋原因 (如 SIXTY_MOVES, STALEMATE等) 仍然是 0
-                     reward_scalar = 0.0
-                     logging.info(f"[ENV_DEBUG] Game Draw. Reward: 0.0, Reason: {termination_reason}, Steps: {self.current_step}")
+                    reward_scalar = 0.0
+                    logging.info(f"[ENV] Draw. Reason: {termination_reason}, Steps: {self.current_step}")
         else:
-            # 游戏未结束
             reward_scalar = 0.0
         
-        # 对外接口仍然使用 shape (1,) 的 ndarray
         reward = np.array([reward_scalar], dtype=np.float32)
-        
         info = {}
         obs = self.observe()
         
         return BaseEnvTimestep(obs, reward, done, info)
 
     def step(self, action: int) -> BaseEnvTimestep:
-        """
-        环境的 step 函数
-        """
+        """环境的 step 函数"""
         if self.battle_mode == 'self_play_mode':
             if self.prob_random_agent > 0:
                 if np.random.rand() < self.prob_random_agent:
                     action = self.random_action()
             elif self.prob_expert_agent > 0:
                 if np.random.rand() < self.prob_expert_agent:
-                    action = self.random_action()  # TODO: 可以接入更强的 bot
+                    action = self.random_action()
             
-            flag = "agent"
-            timestep = self._player_step(action, flag)
+            timestep = self._player_step(action, "agent")
             
             if timestep.done:
-                # 【修复】在自我对弈中，使用规范视角（canonical view）
-                # reward 已经是从执行动作的玩家（当前玩家）视角，直接使用
-                # 不需要转换为 player 1 视角，因为观察也是规范视角
                 reward_scalar = float(timestep.reward[0])
                 timestep.info['eval_episode_return'] = reward_scalar
             
             return timestep
         
         elif self.battle_mode == 'play_with_bot_mode':
-            # 玩家1的回合 (agent)
-            flag = "bot_agent"
-            timestep_player1 = self._player_step(action, flag)
+            timestep_player1 = self._player_step(action, "bot_agent")
             
             if timestep_player1.done:
-                # player 1 执行后游戏结束，reward 已经是 player 1 视角
                 timestep_player1.info['eval_episode_return'] = float(timestep_player1.reward[0])
                 timestep_player1.obs['to_play'] = np.array([-1], dtype=np.int32)
                 return timestep_player1
             
-            # 玩家2（bot）的回合
-            bot_action = self.bot_action()  # 使用UCI引擎或随机策略
-            flag = "bot_bot"
-            timestep_player2 = self._player_step(bot_action, flag)
+            bot_action = self.bot_action()
+            timestep_player2 = self._player_step(bot_action, "bot_bot")
             
-            # player 2 执行后游戏结束，reward 是 player 2 视角，需要转换为 player 1 视角
             reward_scalar = float(timestep_player2.reward[0])
             timestep_player2.info['eval_episode_return'] = -reward_scalar
             timestep_player2 = timestep_player2._replace(reward=-timestep_player2.reward)
-            # [修正] 在 eval_mode 下，返回给 agent 的 observation 应该是轮到 agent (Player 1) 走
-            # 所以 to_play 应该是 1 (RED)，而不是 -1
             timestep_player2.obs['to_play'] = np.array([1], dtype=np.int32)
             
             return timestep_player2
         
         elif self.battle_mode == 'eval_mode':
-            # 玩家1的回合 (agent)
-            flag = "eval_agent"
-            timestep_player1 = self._player_step(action, flag)
+            timestep_player1 = self._player_step(action, "eval_agent")
             
             if timestep_player1.done:
-                # player 1 执行后游戏结束，reward 已经是 player 1 视角
                 timestep_player1.info['eval_episode_return'] = float(timestep_player1.reward[0])
                 timestep_player1.obs['to_play'] = np.array([-1], dtype=np.int32)
                 return timestep_player1
             
-            # 玩家2的回合 (bot 或 human)
             if self.agent_vs_human:
                 bot_action = self.human_to_action()
             else:
-                bot_action = self.bot_action()  # 使用UCI引擎或随机策略
+                bot_action = self.bot_action()
             
-            flag = "eval_bot"
-            timestep_player2 = self._player_step(bot_action, flag)
+            timestep_player2 = self._player_step(bot_action, "eval_bot")
             
-            # player 2 执行后游戏结束，reward 是 player 2 视角，需要转换为 player 1 视角
             reward_scalar = float(timestep_player2.reward[0])
             timestep_player2.info['eval_episode_return'] = -reward_scalar
             timestep_player2 = timestep_player2._replace(reward=-timestep_player2.reward)
-            # [修正] 在 eval_mode 下，返回给 agent 的 observation 应该是轮到 agent (Player 1) 走
-            # 所以 to_play 应该是 1 (RED)，而不是 -1
             timestep_player2.obs['to_play'] = np.array([1], dtype=np.int32)
             
             return timestep_player2
 
     def reset(self, start_player_index: int = 0, init_state: Optional[str] = None) -> dict:
-        """
-        重置环境
-        """
+        """重置环境"""
         if init_state is None:
             self.board = cchess.Board()
         else:
@@ -339,87 +343,45 @@ class ChineseChessEnv(BaseEnv):
         
         self.players = [1, 2]
         self.start_player_index = start_player_index
-        
-        # 重置步数计数器
         self.current_step = 0
-        
-        # 清空渲染帧
         self.frames = []
+        self.move_history = []
         
-        # 确保 _current_player 与 board.turn 保持一致
-        # board.turn: RED=True, BLACK=False
         self._current_player = 1 if self.board.turn else 2
 
         # 重置历史观测
         self.obs_buffer.clear()
-        # 填充初始帧 (使用全0或初始状态重复)
-        init_planes = self._get_raw_planes()
+        init_planes = self._get_canonical_planes()
         for _ in range(self.stack_obs_num):
             self.obs_buffer.append(init_planes)
         
-        # 设置动作空间和观察空间
-        self._action_space = spaces.Discrete(90 * 90)  # 8100 个可能的动作
+        # 设置动作空间和观察空间（使用压缩后的动作空间）
+        self._action_space = spaces.Discrete(ACTION_SPACE_SIZE)
         self._reward_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
         
-        # 计算Observation Shape: (14 * stack + 1, 10, 9)
-        obs_channels = 14 * self.stack_obs_num + 1
+        # 观察空间：(14 * stack, 10, 9) - 去除颜色层
+        obs_channels = 14 * self.stack_obs_num  # 56
         self._observation_space = spaces.Dict(
             {
                 "observation": spaces.Box(low=0, high=1, shape=(obs_channels, 10, 9), dtype=np.float32),
-                "action_mask": spaces.Box(low=0, high=1, shape=(90 * 90,), dtype=np.int8),
+                "action_mask": spaces.Box(low=0, high=1, shape=(ACTION_SPACE_SIZE,), dtype=np.int8),
                 "board": spaces.Box(low=0, high=7, shape=(10, 9), dtype=np.int8),
-                "current_player_index": spaces.Box(low=0, high=1, shape=(1,), dtype=np.int32),  # 0 或 1
-                "to_play": spaces.Box(low=-1, high=2, shape=(1,), dtype=np.int32),  # -1, 1, 或 2
+                "current_player_index": spaces.Box(low=0, high=1, shape=(1,), dtype=np.int32),
+                "to_play": spaces.Box(low=-1, high=2, shape=(1,), dtype=np.int32),
             }
         )
         
-        obs = self.observe()
-        return obs
+        return self.observe()
 
     def current_state(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        获取当前堆叠和转换后的状态
+        获取当前堆叠状态（己方优先编码，无颜色层）
         """
-        # 1. 转换视角 (Canonical View)
-        # 如果是黑方，需要将红方/黑方通道互换，并旋转棋盘
-        stacked_obs = []
-        for planes in self.obs_buffer:
-            if self._current_player == 2: # 黑方
-                # 原始: [0-6: 红, 7-13: 黑]
-                # 目标: [0-6: 黑, 7-13: 红] (视角转换: 己方在前)
-                red_planes = planes[:7]
-                black_planes = planes[7:]
-                
-                # 交换并旋转 180 度
-                # np.rot90(x, 2, axes=(1, 2)) 等价于旋转180度
-                new_own = np.rot90(black_planes, 2, axes=(1, 2))
-                new_opp = np.rot90(red_planes, 2, axes=(1, 2))
-                
-                transformed_planes = np.concatenate([new_own, new_opp], axis=0)
-                stacked_obs.append(transformed_planes)
-            else: # 红方
-                # 原始即为目标: [0-6: 红(己), 7-13: 黑(敌)]
-                stacked_obs.append(planes)
-                
-        # 2. 堆叠历史帧
-        # shape: (14 * stack, 10, 9)
-        state = np.concatenate(stacked_obs, axis=0)
-        
-        # 3. 添加颜色/ToPlay通道 (1层)
-        # 在 Canonical View 下，通常网络总是视为"执红先手"视角
-        # 但添加一个 feature map 全 1 (current) 或其他标记也是常见的
-        # 这里保持原逻辑，如果是 player 1 (Red) 则全1，否则全0?
-        # 不，既然已经旋转了视角，颜色通道应该表示 "当前是谁的回合" 还是 "我是谁"？
-        # AlphaZero中，颜色通道是 constant 1 (if P1) or 0 (if P2). 
-        # 但如果视角统一了，这个通道可以帮助区分先后手优势。
-        color_plane = np.zeros((1, 10, 9), dtype=np.float32)
-        if self._current_player == 1:
-            color_plane[:] = 1.0
-        
-        state = np.concatenate([state, color_plane], axis=0)
+        # 堆叠历史帧，shape: (14 * stack, 10, 9) = (56, 10, 9)
+        state = np.concatenate(list(self.obs_buffer), axis=0)
         
         if self.scale:
-            scale_state = state / 2 # 简单缩放，实际上binary plane不需要
+            scale_state = state / 2
         else:
             scale_state = state
         
@@ -429,23 +391,20 @@ class ChineseChessEnv(BaseEnv):
             return state, scale_state
 
     def observe(self) -> dict:
-        """
-        返回观察
-        """
+        """返回观察"""
         legal_actions_list = self.legal_actions
         
-        action_mask = np.zeros(90 * 90, dtype=np.int8)
+        action_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.int8)
         for action in legal_actions_list:
             action_mask[action] = 1
         
-        # 获取棋盘的可视化表示
+        # 棋盘可视化表示
         board_visual = np.zeros((10, 9), dtype=np.int8)
         for square in range(90):
             piece = self.board.piece_at(square)
             if piece:
                 row = cchess.square_row(square)
                 col = cchess.square_column(square)
-                # 棋子类型编码：1-7
                 board_visual[row, col] = piece.piece_type
         
         if self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
@@ -467,70 +426,56 @@ class ChineseChessEnv(BaseEnv):
 
     @property
     def legal_actions(self) -> List[int]:
-        """
-        返回所有合法动作的索引列表
-        """
-        legal_moves = list(self.board.legal_moves)
-        return [move_to_action(move) for move in legal_moves]
+        """返回所有合法动作的索引列表（使用压缩映射）"""
+        legal_actions_list = []
+        for move in self.board.legal_moves:
+            key = (move.from_square, move.to_square)
+            if key in MOVE_TO_ACTION:
+                legal_actions_list.append(MOVE_TO_ACTION[key])
+            else:
+                # 这不应该发生，但为了安全起见记录警告
+                logging.warning(f"移动 {key} 不在映射表中，跳过")
+        return legal_actions_list
 
     def get_done_winner(self) -> Tuple[bool, int]:
-        """
-        检查游戏是否结束并返回胜者
-        Returns:
-            - done: 游戏是否结束
-            - winner: 胜者，1 表示红方，2 表示黑方，-1 表示和棋或游戏未结束
-        """
-        # 检查是否达到最大步数
+        """检查游戏是否结束并返回胜者"""
         if self.current_step >= self.max_episode_steps:
-            return True, -1  # 达到最大步数，视为平局
+            return True, -1
         
         done = self.board.is_game_over()
         if not done:
             return False, -1
         
         outcome = self.board.outcome()
-        if outcome is None:
-            return done, -1
-        
-        if outcome.winner is None:
-            return True, -1  # 和棋
+        if outcome is None or outcome.winner is None:
+            return True, -1
         elif outcome.winner == cchess.RED:
-            return True, 1  # 红方胜
+            return True, 1
         else:
-            return True, 2  # 黑方胜
+            return True, 2
 
     def get_done_reward(self) -> Tuple[bool, Optional[int]]:
-        """
-        检查游戏是否结束并从玩家1的视角返回奖励
-        """
+        """检查游戏是否结束并从玩家1的视角返回奖励"""
         done, winner = self.get_done_winner()
         if not done:
             return False, None
         
         if winner == 1:
-            reward = 1
+            return True, 1
         elif winner == 2:
-            reward = -1
+            return True, -1
         else:
-            reward = 0
-        
-        return done, reward
+            return True, 0
 
     def random_action(self) -> int:
-        """
-        随机选择一个合法动作
-        """
-        legal_actions_list = self.legal_actions
-        return np.random.choice(legal_actions_list)
+        """随机选择一个合法动作"""
+        return np.random.choice(self.legal_actions)
     
     def bot_action(self) -> int:
-        """
-        使用UCI引擎或随机策略选择动作
-        """
+        """使用UCI引擎或随机策略选择动作"""
         if self.engine is not None:
             try:
                 from .cchess import engine as engine_module
-                # 使用引擎计算最佳走法，按深度限制
                 limit = engine_module.Limit(depth=self.engine_depth)
                 result = self.engine.play(self.board, limit)
                 return move_to_action(result.move)
@@ -541,9 +486,7 @@ class ChineseChessEnv(BaseEnv):
             return self.random_action()
 
     def human_to_action(self) -> int:
-        """
-        从人类输入获取动作
-        """
+        """从人类输入获取动作"""
         print(self.board.unicode(axes=True, axes_type=0))
         while True:
             try:
@@ -567,7 +510,7 @@ class ChineseChessEnv(BaseEnv):
         np.random.seed(self._seed)
 
     def __repr__(self) -> str:
-        return "LightZero ChineseChess Env"
+        return "LightZero ChineseChess Env (Refactored)"
 
     @property
     def current_player(self) -> int:
@@ -594,78 +537,19 @@ class ChineseChessEnv(BaseEnv):
         return self._reward_space
 
     def copy(self) -> 'ChineseChessEnv':
-        """
-        高效复制环境
-        替代 copy.deepcopy(self)，只复制必要的动态状态
-        """
-        cls = self.__class__
-        new_env = cls.__new__(cls)
-        
-        # 复制不可变配置
-        new_env.cfg = self.cfg
-        new_env.channel_last = self.channel_last
-        new_env.scale = self.scale
-        new_env.render_mode = self.render_mode
-        new_env.replay_path = self.replay_path
-        new_env.battle_mode = self.battle_mode
-        new_env.battle_mode_in_simulation_env = self.battle_mode_in_simulation_env
-        new_env.agent_vs_human = self.agent_vs_human
-        new_env.prob_random_agent = self.prob_random_agent
-        new_env.prob_expert_agent = self.prob_expert_agent
-        new_env.uci_engine_path = self.uci_engine_path
-        new_env.engine_depth = self.engine_depth
-        new_env.max_episode_steps = self.max_episode_steps
-        new_env.players = self.players
-        new_env.start_player_index = self.start_player_index
-        
-        # 预计算表
-        new_env._piece_types = self._piece_types
-        new_env._colors = self._colors
-        new_env._square_to_coord = self._square_to_coord
-        
-        # 复制动态状态 (需要拷贝)
-        new_env.current_step = self.current_step
-        new_env._current_player = self._current_player
-        new_env.frames = [] # frames 一般不需要在 simulate 中复制
-        new_env.engine = None # simulator 不需要 engine
-        new_env._env = new_env
-        
-        # 关键：Board 的 copy，cchess.Board.copy() 已经是浅拷贝优化过的
-        new_env.board = self.board.copy()
-        
-        # 关键：obs_buffer 的 copy
-        # deque 本身浅拷贝即可，里面的 numpy array 是新的
-        new_env.stack_obs_num = self.stack_obs_num
-        new_env.obs_buffer = copy.copy(self.obs_buffer)
-        
-        # 空间定义
-        new_env._action_space = self._action_space
-        new_env._reward_space = self._reward_space
-        new_env._observation_space = self._observation_space
-        
-        return new_env
+        """复制环境（使用 deepcopy 简化实现）"""
+        return copy.deepcopy(self)
 
     def simulate_action(self, action: int) -> Any:
-        """
-        模拟执行动作并返回新的模拟环境（用于 AlphaZero/MuZero 的 MCTS）
-        """
+        """模拟执行动作并返回新的模拟环境（用于 MCTS）"""
         if action not in self.legal_actions:
             raise ValueError(f"动作 {action} 不合法")
         
-        # 创建新环境 (使用高效拷贝)
         new_env = self.copy()
-        
         move = action_to_move(action)
         new_env.board.push(move)
-        
-        # 增加步数计数
         new_env.current_step += 1
-        
-        # board.push() 已经自动切换了 turn，需要同步更新 _current_player
-        # board.turn: RED=True(1), BLACK=False(0)
         new_env._current_player = 1 if new_env.board.turn else 2
-
-        # 关键：同步更新历史观测
         new_env._update_obs_buffer()
         
         return new_env
@@ -683,87 +567,77 @@ class ChineseChessEnv(BaseEnv):
         cfg.battle_mode = 'eval_mode'
         return [cfg for _ in range(evaluator_env_num)]
 
-    def render(self, mode: str = None) -> None:
+    def render(self, mode: str = None) -> Optional[str]:
         """
         渲染棋盘
         
-        根据LightZero官方文档：https://opendilab.github.io/LightZero/tutorials/envs/customize_envs.html
-        
         Args:
             mode: 渲染模式
-                - 'state_realtime_mode': 实时打印棋盘状态（文本）
-                - 'image_realtime_mode': 实时显示SVG图像（暂不支持窗口显示）
-                - 'image_savefile_mode': 保存SVG到frames，游戏结束后可转为文件
-                - 'human': 等同于'state_realtime_mode'
-                - 'svg': 返回SVG字符串（棋类游戏特有）
+                - 'state_realtime_mode' / 'human': 打印棋盘到控制台
+                - 'image_savefile_mode': 保存 SVG 帧
+                - 'svg': 返回 SVG 字符串
+                - 'html': 保存 HTML 回放文件（游戏结束时）
         """
         mode = mode or self.render_mode
         
         if mode is None:
             return None
         
-        # LightZero标准模式：state_realtime_mode
         if mode in ['state_realtime_mode', 'human']:
-            # 实时打印Unicode棋盘到控制台
             print("\n" + "=" * 50)
             print(f"步数: {self.current_step} | 当前玩家: {'红方' if self._current_player == 1 else '黑方'}")
             print(self.board.unicode(axes=True, axes_type=1))
             print("=" * 50)
             return None
         
-        # LightZero标准模式：image_savefile_mode
         elif mode == 'image_savefile_mode':
-            # 保存SVG到frames列表，游戏结束后可用save_render_output转为文件
             try:
                 from .cchess import svg
                 last_move = self.board.peek() if self.board.move_stack else None
-                svg_str = svg.board(
-                    self.board,
-                    lastmove=last_move,
-                    size=400
-                )
+                svg_str = svg.board(self.board, lastmove=last_move, size=400)
                 self.frames.append(svg_str)
             except Exception as e:
                 logging.warning(f"SVG渲染失败: {e}")
             return None
         
-        # LightZero标准模式：image_realtime_mode
-        elif mode == 'image_realtime_mode':
-            # 实时显示图像（对于SVG，暂不支持窗口显示）
-            logging.warning("image_realtime_mode暂不支持实时窗口显示，请使用image_savefile_mode")
-            return None
-        
-        # 棋类游戏特有：直接返回SVG字符串
         elif mode == 'svg':
             try:
                 from .cchess import svg
                 last_move = self.board.peek() if self.board.move_stack else None
-                svg_str = svg.board(
-                    self.board,
-                    lastmove=last_move,
-                    size=400
-                )
-                return svg_str
+                return svg.board(self.board, lastmove=last_move, size=400)
             except Exception as e:
                 logging.warning(f"SVG渲染失败: {e}")
                 return None
         
-        # 其他模式
+        elif mode == 'html':
+            # HTML 模式：记录帧用于后续生成 HTML
+            try:
+                from .cchess import svg
+                last_move = self.board.peek() if self.board.move_stack else None
+                svg_str = svg.board(self.board, lastmove=last_move, size=400)
+                self.frames.append(svg_str)
+            except Exception as e:
+                logging.warning(f"SVG渲染失败: {e}")
+            return None
+        
         else:
             logging.warning(f"不支持的渲染模式: {mode}")
             return None
     
-    def save_render_output(self, replay_path: str = None, format: str = 'svg') -> None:
+    def save_render_output(self, replay_path: str = None, format: str = 'svg') -> Optional[str]:
         """
         保存渲染输出到文件
         
         Args:
-            replay_path: 保存路径，如果为None则使用self.replay_path
-            format: 保存格式，目前支持'svg'
+            replay_path: 保存路径
+            format: 'svg' 或 'html'
+            
+        Returns:
+            HTML 格式时返回文件路径
         """
-        if not self.frames:
+        if not self.frames and format != 'html':
             logging.warning("没有可保存的渲染帧")
-            return
+            return None
         
         save_path = replay_path or self.replay_path
         if save_path is None:
@@ -777,11 +651,20 @@ class ChineseChessEnv(BaseEnv):
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(svg_str)
             logging.info(f"已保存 {len(self.frames)} 个SVG文件到 {save_path}")
+            self.frames = []
+            return None
+        
+        elif format == 'html':
+            from .html_render import generate_html_replay
+            html_path = os.path.join(save_path, 'replay.html')
+            generate_html_replay(self.move_history, self.frames, html_path)
+            logging.info(f"已保存 HTML 回放到 {html_path}")
+            self.frames = []
+            return html_path
+        
         else:
             logging.warning(f"不支持的保存格式: {format}")
-        
-        # 清空frames
-        self.frames = []
+            return None
     
     def close(self) -> None:
         """关闭环境，释放资源"""

@@ -195,42 +195,37 @@ SQUARES = [
 
 SQUARE_NAMES = [c + r for r in ROW_NAMES for c in COLUMN_NAMES]
 
+# 预计算查找表
+SQUARE_COLUMNS = tuple(sq % 9 for sq in range(90))
+SQUARE_ROWS = tuple(sq // 9 for sq in range(90))
+SQUARE_DISTANCE = tuple(
+    tuple(max(abs(a % 9 - b % 9), abs(a // 9 - b // 9)) for b in range(90))
+    for a in range(90)
+)
+
 
 def parse_square(name: str):
-    """
-    Gets the square index for the given square *name*
-    (e.g., ``a0`` returns ``0``).
-
-    :raises: :exc:`ValueError` if the square name is invalid.
-    """
     return SQUARE_NAMES.index(name)
 
 
 def square_name(square: Square):
-    """Gets the name of the square, like ``a3``."""
     return SQUARE_NAMES[square]
 
 
 def square(column_index: int, row_index: int):
-    """Gets a square number by column and row index."""
     return row_index * 9 + column_index
 
 
 def square_column(square: Square) -> int:
-    """Gets the column index of the square where ``0`` is the a-column."""
-    return square % 9
+    return SQUARE_COLUMNS[square]
 
 
 def square_row(square: Square) -> int:
-    """Gets the row index of the square where ``0`` is the first row."""
-    return square // 9
+    return SQUARE_ROWS[square]
 
 
 def square_distance(a: Square, b: Square) -> int:
-    """
-    Gets the distance (i.e., the number of king steps) from square *a* to *b*.
-    """
-    return max(abs(square_column(a) - square_column(b)), abs(square_row(a) - square_row(b)))
+    return SQUARE_DISTANCE[a][b]
 
 
 def square_mirror(square: Square) -> Square:
@@ -308,20 +303,15 @@ BB_START_OCCUPIED = 0x3fe00415540000aaa0801ff
 
 def _sliding_attacks(square: Square, occupied: BitBoard, deltas: Iterable[int]):
     attacks = BB_EMPTY
-
     for delta in deltas:
         sq = square
-
         while True:
             sq += delta
-            if not (0 <= sq < 90) or square_distance(sq, sq - delta) > 2:
+            if not (0 <= sq < 90) or SQUARE_DISTANCE[sq][sq - delta] > 2:
                 break
-
             attacks |= BB_SQUARES[sq]
-
             if occupied & BB_SQUARES[sq]:
                 break
-
     return attacks
 
 
@@ -331,68 +321,111 @@ def _step_attacks(square: Square, deltas: Iterable[int], restriction: BitBoard =
     return restriction & _sliding_attacks(square, BB_ALL, deltas)
 
 
-KNIGHT_LEG_DELTAS = [1, 9, -1, -9]
-KNIGHT_ATTACK_DELTAS = [-7, 11, 17, 19, -11, 7, -19, -17]
+KNIGHT_LEG_DELTAS = (1, 9, -1, -9)
+KNIGHT_ATTACK_DELTAS = (-7, 11, 17, 19, -11, 7, -19, -17)
+
+
+# 预计算马的攻击表: BB_KNIGHT_MOVES[square] = ((leg_bb, attacks_bb), ...)
+def _init_knight_moves():
+    result = []
+    for sq in range(90):
+        moves = []
+        for i, leg_delta in enumerate(KNIGHT_LEG_DELTAS):
+            leg_sq = sq + leg_delta
+            if not (0 <= leg_sq < 90) or SQUARE_DISTANCE[leg_sq][sq] > 1:
+                continue
+            leg_bb = BB_SQUARES[leg_sq]
+            attacks = BB_EMPTY
+            for delta in KNIGHT_ATTACK_DELTAS[2 * i: 2 * i + 2]:
+                to_sq = sq + delta
+                if 0 <= to_sq < 90 and SQUARE_DISTANCE[to_sq][sq] <= 2:
+                    attacks |= BB_SQUARES[to_sq]
+            if attacks:
+                moves.append((leg_bb, attacks))
+        result.append(tuple(moves))
+    return tuple(result)
+
+
+BB_KNIGHT_MOVES = _init_knight_moves()
 
 
 def _knight_attacks(square: Square, occupied: BitBoard):
     attacks = BB_EMPTY
-
-    for i, leg_delta in enumerate(KNIGHT_LEG_DELTAS):
-        leg_sq = square + leg_delta
-        if not (0 <= leg_sq < 90):
-            continue
-        if not occupied & BB_SQUARES[leg_sq]:
-            attack_deltas = KNIGHT_ATTACK_DELTAS[2 * i: 2 * i + 2]
-            for delta in attack_deltas:
-                sq = square + delta
-                if not (0 <= sq < 90) or square_distance(sq, square) > 2:
-                    continue
-                attacks |= BB_SQUARES[sq]
-
+    for leg_bb, targets in BB_KNIGHT_MOVES[square]:
+        if not (occupied & leg_bb):
+            attacks |= targets
     return attacks
 
 
-KNIGHT_ATTACKER_LEG_DELTAS = [8, 10, -8, -10]
-KNIGHT_ATTACKER_DELTAS = [7, 17, 19, 11, -7, -17, -19, -11]
+KNIGHT_ATTACKER_LEG_DELTAS = (8, 10, -8, -10)
+KNIGHT_ATTACKER_DELTAS = (7, 17, 19, 11, -7, -17, -19, -11)
+
+
+# 预计算能攻击到某格的马的位置表
+def _init_knight_attackers():
+    result = []
+    for sq in range(90):
+        moves = []
+        for i, leg_delta in enumerate(KNIGHT_ATTACKER_LEG_DELTAS):
+            leg_sq = sq + leg_delta
+            if not (0 <= leg_sq < 90) or SQUARE_DISTANCE[leg_sq][sq] > 1:
+                continue
+            leg_bb = BB_SQUARES[leg_sq]
+            attackers = BB_EMPTY
+            for delta in KNIGHT_ATTACKER_DELTAS[2 * i: 2 * i + 2]:
+                from_sq = sq + delta
+                if 0 <= from_sq < 90 and SQUARE_DISTANCE[from_sq][sq] <= 2:
+                    attackers |= BB_SQUARES[from_sq]
+            if attackers:
+                moves.append((leg_bb, attackers))
+        result.append(tuple(moves))
+    return tuple(result)
+
+
+BB_KNIGHT_ATTACKERS = _init_knight_attackers()
 
 
 def _knights_can_attack(square: Square, occupied: BitBoard):
     attackers = BB_EMPTY
-
-    for i, leg_delta in enumerate(KNIGHT_ATTACKER_LEG_DELTAS):
-        leg_sq = square + leg_delta
-        if not (0 <= leg_sq < 90):
-            continue
-        if not occupied & BB_SQUARES[leg_sq]:
-            attack_deltas = KNIGHT_ATTACKER_DELTAS[2 * i: 2 * i + 2]
-            for delta in attack_deltas:
-                sq = square + delta
-                if not (0 <= sq < 90) or square_distance(sq, square) > 2:
-                    continue
-                attackers |= BB_SQUARES[sq]
-
+    for leg_bb, sources in BB_KNIGHT_ATTACKERS[square]:
+        if not (occupied & leg_bb):
+            attackers |= sources
     return attackers
 
 
-BISHOP_EYE_DELTAS = [8, -8, 10, -10]
-BISHOP_ATTACK_DELTAS = [16, -16, 20, -20]
+BISHOP_EYE_DELTAS = (8, -8, 10, -10)
+BISHOP_ATTACK_DELTAS = (16, -16, 20, -20)
+
+
+# 预计算象的攻击表
+def _init_bishop_moves():
+    result = [[], []]
+    for color in (0, 1):
+        for sq in range(90):
+            moves = []
+            for delta, eye_delta in zip(BISHOP_ATTACK_DELTAS, BISHOP_EYE_DELTAS):
+                eye_sq = sq + eye_delta
+                if not (0 <= eye_sq < 90) or SQUARE_DISTANCE[eye_sq][sq] > 1:
+                    continue
+                to_sq = sq + delta
+                if not (0 <= to_sq < 90) or SQUARE_DISTANCE[to_sq][sq] > 2:
+                    continue
+                if not (BB_SQUARES[to_sq] & BB_BISHOP_POS[color]):
+                    continue
+                moves.append((BB_SQUARES[eye_sq], BB_SQUARES[to_sq]))
+            result[color].append(tuple(moves))
+    return tuple(tuple(r) for r in result)
+
+
+BB_BISHOP_MOVES = _init_bishop_moves()
 
 
 def _bishop_attacks(square: Square, occupied: BitBoard, color: int):
     attacks = BB_EMPTY
-
-    for delta, leg_delta in zip(BISHOP_ATTACK_DELTAS, BISHOP_EYE_DELTAS):
-        eye_sq = square + leg_delta
-        if not (0 <= eye_sq < 90):
-            continue
-        if not occupied & BB_SQUARES[eye_sq]:
-            sq = square + delta
-            if not (0 <= sq < 90) or square_distance(sq, square) > 2:
-                continue
-            attacks |= BB_SQUARES[sq]
-
-    return attacks & BB_BISHOP_POS[color]
+    for eye_bb, target in BB_BISHOP_MOVES[color][square]:
+        if not (occupied & eye_bb):
+            attacks |= target
+    return attacks
 
 
 BB_PAWN_ATTACKS = [[], []]
@@ -454,41 +487,25 @@ def _rook_attacks(square: Square, occupied: BitBoard):
 
 def _cannon_attacks(square: Square, occupied: BitBoard):
     attacks = BB_EMPTY
-
-    for delta in [1, -1, 9, -9]:
+    for delta in (1, -1, 9, -9):
         sq = square
-        occupied_num = 0
-
+        found_mount = False
         while True:
             sq += delta
-            if not (0 <= sq < 90) or square_distance(sq, sq - delta) > 2:
+            if not (0 <= sq < 90) or SQUARE_DISTANCE[sq][sq - delta] > 2:
                 break
-
             if occupied & BB_SQUARES[sq]:
-                occupied_num += 1
-                if occupied_num == 2:
+                if found_mount:
                     attacks |= BB_SQUARES[sq]
                     break
-
+                found_mount = True
     return attacks
 
 
 def _cannon_slides(square: Square, occupied: BitBoard):
-    slides = BB_EMPTY
-
-    for delta in [1, -1, 9, -9]:
-        sq = square
-
-        while True:
-            sq += delta
-            if not (0 <= sq < 90) or square_distance(sq, sq - delta) > 2:
-                break
-
-            if occupied & BB_SQUARES[sq]:
-                break
-            slides |= BB_SQUARES[sq]
-
-    return slides
+    row_pieces = BB_ROW_MASKS[square] & occupied
+    col_pieces = BB_COLUMN_MASKS[square] & occupied
+    return (BB_ROW_ATTACKS[square][row_pieces] | BB_COLUMN_ATTACKS[square][col_pieces]) & ~occupied
 
 
 def msb(bb: BitBoard):
@@ -590,7 +607,7 @@ class Move:
     @classmethod
     def from_uci(cls, uci: str):
         if uci == "0000":
-            return cls.null() 
+            return cls.null()
         elif len(uci) == 4:
             from_square = SQUARE_NAMES.index(uci[0:2])
             to_square = SQUARE_NAMES.index(uci[2:4])
@@ -1439,11 +1456,98 @@ class Board(BaseBoard):
             self.pop()
 
     def _is_safe(self, move: Move) -> bool:
-        try:
-            self.push(move)
-            return not (bool(self.attackers_mask(self.turn, self.king(not self.turn))) | self.is_king_line_of_sight())
-        finally:
-            self.pop()
+        # 轻量级检测：直接修改位棋盘，避免完整的push/pop开销
+        from_sq, to_sq = move.from_square, move.to_square
+        from_bb = BB_SQUARES[from_sq]
+        to_bb = BB_SQUARES[to_sq]
+
+        # 保存状态
+        piece_type = self.piece_type_at(from_sq)
+        captured_type = self.piece_type_at(to_sq)
+        turn = self.turn
+
+        # 快速移动棋子
+        self._quick_move(from_sq, to_sq, from_bb, to_bb, piece_type, captured_type, turn)
+
+        # 检查是否安全
+        king_sq = self.king(turn)
+        is_safe = not bool(self.attackers_mask(not turn, king_sq)) and not self.is_king_line_of_sight()
+
+        # 还原
+        self._quick_unmove(from_sq, to_sq, from_bb, to_bb, piece_type, captured_type, turn)
+
+        return is_safe
+
+    def _quick_move(self, from_sq, to_sq, from_bb, to_bb, piece_type, captured_type, turn):
+        # 移除起点棋子
+        piece_bb = self._get_piece_bb(piece_type)
+        piece_bb ^= from_bb
+        self._set_piece_bb(piece_type, piece_bb)
+        self.occupied ^= from_bb
+        self.occupied_co[turn] ^= from_bb
+
+        # 如果有吃子
+        if captured_type:
+            cap_bb = self._get_piece_bb(captured_type)
+            cap_bb ^= to_bb
+            self._set_piece_bb(captured_type, cap_bb)
+            self.occupied ^= to_bb
+            self.occupied_co[not turn] ^= to_bb
+
+        # 放置终点棋子
+        piece_bb = self._get_piece_bb(piece_type)
+        piece_bb |= to_bb
+        self._set_piece_bb(piece_type, piece_bb)
+        self.occupied |= to_bb
+        self.occupied_co[turn] |= to_bb
+
+    def _quick_unmove(self, from_sq, to_sq, from_bb, to_bb, piece_type, captured_type, turn):
+        # 移除终点棋子
+        piece_bb = self._get_piece_bb(piece_type)
+        piece_bb ^= to_bb
+        self._set_piece_bb(piece_type, piece_bb)
+        self.occupied ^= to_bb
+        self.occupied_co[turn] ^= to_bb
+
+        # 如果有吃子，还原被吃棋子
+        if captured_type:
+            cap_bb = self._get_piece_bb(captured_type)
+            cap_bb |= to_bb
+            self._set_piece_bb(captured_type, cap_bb)
+            self.occupied |= to_bb
+            self.occupied_co[not turn] |= to_bb
+
+        # 还原起点棋子
+        piece_bb = self._get_piece_bb(piece_type)
+        piece_bb |= from_bb
+        self._set_piece_bb(piece_type, piece_bb)
+        self.occupied |= from_bb
+        self.occupied_co[turn] |= from_bb
+
+    def _get_piece_bb(self, piece_type):
+        if piece_type == PAWN: return self.pawns
+        if piece_type == ROOK: return self.rooks
+        if piece_type == KNIGHT: return self.knights
+        if piece_type == BISHOP: return self.bishops
+        if piece_type == ADVISOR: return self.advisors
+        if piece_type == KING: return self.kings
+        return self.cannons
+
+    def _set_piece_bb(self, piece_type, bb):
+        if piece_type == PAWN:
+            self.pawns = bb
+        elif piece_type == ROOK:
+            self.rooks = bb
+        elif piece_type == KNIGHT:
+            self.knights = bb
+        elif piece_type == BISHOP:
+            self.bishops = bb
+        elif piece_type == ADVISOR:
+            self.advisors = bb
+        elif piece_type == KING:
+            self.kings = bb
+        else:
+            self.cannons = bb
 
     def generate_pseudo_legal_moves(self, from_mask: BitBoard = BB_ALL, to_mask: BitBoard = BB_ALL) -> Iterator[Move]:
         our_pieces = self.occupied_co[self.turn]
