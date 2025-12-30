@@ -235,11 +235,21 @@ class GPUInferenceServer:
         # policy_config.device 可能是 'cuda' 而不是 'cuda:4'，导致设备不匹配
         try:
             self._device = next(policy._collect_model.parameters()).device
-        except (StopIteration, AttributeError):
-            self._device = policy_config.device
+            if self._logger:
+                self._logger.info(f"GPUInferenceServer 从模型参数获取设备: {self._device}")
+        except (StopIteration, AttributeError) as e:
+            # 回退方案：使用当前CUDA设备
+            if torch.cuda.is_available():
+                current_device = torch.cuda.current_device()
+                self._device = f'cuda:{current_device}'
+            else:
+                self._device = policy_config.device
+            if self._logger:
+                self._logger.warning(f"无法从模型获取设备({e})，使用: {self._device}")
         
         if self._logger:
-            self._logger.info(f"GPUInferenceServer 使用设备: {self._device}")
+            self._logger.info(f"GPUInferenceServer 最终使用设备: {self._device}, "
+                            f"policy_config.device={policy_config.device}")
         
         self._running = False
         self._thread = None
@@ -317,7 +327,7 @@ class GPUInferenceServer:
         """
         执行推理 - 从共享内存读取数据，结果写入共享内存
         """
-        # 从共享内存读取obs（零拷贝）
+        # 从共享内存读取obs
         obs_buffer = self._shared_obs_buffer.get_buffer(request.actor_id)
         stack_obs = obs_buffer[:request.batch_size].to(self._device)
         
@@ -332,21 +342,50 @@ class GPUInferenceServer:
             timestep=request.timestep
         )
         
-        # 将结果写入共享内存（零拷贝）
+        # 将结果写入共享内存
         resp_buffer = self._shared_response_buffer.get_buffer(request.actor_id)
         
         for i, env_id in enumerate(request.ready_env_id):
             output = policy_output[env_id]
-            resp_buffer['actions'][i] = output['action']
-            resp_buffer['searched_values'][i] = output['searched_value']
-            resp_buffer['predicted_values'][i] = output['predicted_value']
+            
+            # 处理不同类型的值（可能是numpy、tensor或python标量）
+            action = output['action']
+            searched_value = output['searched_value']
+            predicted_value = output['predicted_value']
+            
+            # 转换为Python标量
+            if hasattr(action, 'item'):
+                action = action.item()
+            elif isinstance(action, np.ndarray):
+                action = action.item() if action.size == 1 else int(action.flat[0])
+            
+            if hasattr(searched_value, 'item'):
+                searched_value = searched_value.item()
+            elif isinstance(searched_value, np.ndarray):
+                searched_value = float(searched_value.flat[0])
+                
+            if hasattr(predicted_value, 'item'):
+                predicted_value = predicted_value.item()
+            elif isinstance(predicted_value, np.ndarray):
+                predicted_value = float(predicted_value.flat[0])
+            
+            resp_buffer['actions'][i] = action
+            resp_buffer['searched_values'][i] = searched_value
+            resp_buffer['predicted_values'][i] = predicted_value
             
             if 'visit_count_distributions' in output:
                 visit_dist = output['visit_count_distributions']
+                if isinstance(visit_dist, np.ndarray):
+                    visit_dist = visit_dist.tolist()
                 resp_buffer['visit_counts'][i, :len(visit_dist)] = torch.tensor(visit_dist, dtype=torch.float32)
             
             if 'visit_count_distribution_entropy' in output:
-                resp_buffer['visit_entropy'][i] = output['visit_count_distribution_entropy']
+                entropy = output['visit_count_distribution_entropy']
+                if hasattr(entropy, 'item'):
+                    entropy = entropy.item()
+                elif isinstance(entropy, np.ndarray):
+                    entropy = float(entropy.flat[0])
+                resp_buffer['visit_entropy'][i] = entropy
 
 
 # =============================================================================
