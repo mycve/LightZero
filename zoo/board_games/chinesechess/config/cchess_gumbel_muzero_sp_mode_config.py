@@ -88,7 +88,7 @@ cchess_gumbel_muzero_config = dict(
         batch_size=batch_size,
         optim_type='Adam',
         piecewise_decay_lr_scheduler=False,
-        learning_rate=0.0003,
+        learning_rate=0.003,
         grad_clip_value=0.5,
         # MCTS 参数
         num_simulations=num_simulations,
