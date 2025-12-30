@@ -1,4 +1,5 @@
 from easydict import EasyDict
+from zoo.board_games.chinesechess.envs.action_mapping import ACTION_SPACE_SIZE
 
 # ==============================================================
 # 最常修改的配置参数
@@ -8,13 +9,14 @@ use_multi_gpu = True  # 开启多GPU训练
 gpu_num = 8  # 使用的GPU数量，根据实际情况修改
 batch_size = 128
 
-collector_env_num = 4
-n_episode = 64
+collector_env_num = 128
+n_episode = 128
 evaluator_env_num = 10
 num_simulations = 20  # 增加到 400 以提升搜索质量,目前简单测试时，先设置为20
 update_per_collect = 10
 reanalyze_ratio = 0.0  # 利用MuZero重分析优势，提升样本利用率
 max_env_step = int(1e8)  # 中国象棋需要更多训练步数
+max_episode_steps = 200  # 最大回合数
 # ==============================================================
 # 配置参数结束
 # ==============================================================
@@ -28,22 +30,24 @@ cchess_muzero_config = dict(
         evaluator_env_num=evaluator_env_num,
         n_evaluator_episode=evaluator_env_num,
         manager=dict(shared_memory=True, ),
+        # 游戏规则
+        max_episode_steps=max_episode_steps,
+        draw_as_loss=True,  # 和棋判双方都输
         # UCI引擎配置（可选，用于eval_mode评估）
-        # uci_engine_path='pikafish',  # UCI引擎路径，如 'pikafish' 或 '/path/to/pikafish'
-        # engine_depth=10,  # 引擎搜索深度，1-20，越大越强（5=弱，10=中，15=强，20=很强）
-        # render_mode='human',  # 渲染模式: 'human'打印棋盘, 'svg'生成SVG
+        # uci_engine_path='pikafish',
+        # engine_depth=10,
     ),
     policy=dict(
         model=dict(
-            # 15层 * 4帧 + 1层颜色 = 57层
-            # 14层(7己+7敌) * 4历史 + 1颜色
-            observation_shape=(57, 10, 9),
-            action_space_size=90 * 90,  # 8100 个可能的动作
-            image_channel=57,  # 匹配 observation_shape
-            num_res_blocks=9,  # 增加到9个残差块，匹配中国象棋复杂度
-            num_channels=128,  # 增加通道数
-            reward_support_range=(-2., 3., 1.),  # 范围[-2,2]共5类，高效且安全
-            value_support_range=(-2., 3., 1.),  # 范围[-2,2]共5类，完全满足-1/0/1奖励
+            model_type='conv',
+            # 14层(7己+7敌) * 4历史 = 56层（去除颜色层）
+            observation_shape=(56, 10, 9),
+            action_space_size=ACTION_SPACE_SIZE,  # 2238 压缩后的动作空间
+            image_channel=56,
+            num_res_blocks=9,
+            num_channels=128,
+            reward_support_range=(-2., 3., 1.),
+            value_support_range=(-2., 3., 1.),
         ),
         cuda=True,
         multi_gpu=use_multi_gpu,  # 开启多GPU数据并行

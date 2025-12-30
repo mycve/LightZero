@@ -86,7 +86,8 @@ class ChineseChessEnv(BaseEnv):
         channel_last=False,
         scale=False,
         stop_value=2,
-        max_episode_steps=500,  # 最大回合数限制，防止无限回合
+        max_episode_steps=200,  # 最大回合数限制，防止无限回合
+        draw_as_loss=True,  # 和棋判双方都输（鼓励进攻）
     )
 
     @classmethod
@@ -129,6 +130,9 @@ class ChineseChessEnv(BaseEnv):
         # 最大步数限制
         self.max_episode_steps = cfg.max_episode_steps
         self.current_step = 0
+        
+        # 和棋策略：True 表示和棋判双方都输（鼓励进攻）
+        self.draw_as_loss = cfg.get('draw_as_loss', True)
         
         # 渲染相关
         self.frames = []  # 用于保存渲染帧
@@ -258,15 +262,22 @@ class ChineseChessEnv(BaseEnv):
                            f"Reward: {reward_scalar}, Reason: {termination_reason}, Steps: {self.current_step}")
             else:
                 # 和棋或特殊情况处理
-                if termination_reason == cchess.Termination.FOURFOLD_REPETITION:
-                    reward_scalar = -1.0  # 重复局面判负
-                    logging.info(f"[ENV] Repetition! ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
-                elif self.current_step >= self.max_episode_steps:
-                    reward_scalar = -1.0  # 超时判负
-                    logging.info(f"[ENV] MaxSteps! ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
+                # draw_as_loss=True 时，所有和棋情况都判负（鼓励进攻）
+                if self.draw_as_loss:
+                    reward_scalar = -1.0
+                    logging.info(f"[ENV] Draw->Loss! Reason: {termination_reason}, "
+                               f"ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
                 else:
-                    reward_scalar = 0.0
-                    logging.info(f"[ENV] Draw. Reason: {termination_reason}, Steps: {self.current_step}")
+                    # 原始逻辑：只有特定情况判负
+                    if termination_reason == cchess.Termination.FOURFOLD_REPETITION:
+                        reward_scalar = -1.0
+                        logging.info(f"[ENV] Repetition! ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
+                    elif self.current_step >= self.max_episode_steps:
+                        reward_scalar = -1.0
+                        logging.info(f"[ENV] MaxSteps! ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
+                    else:
+                        reward_scalar = 0.0
+                        logging.info(f"[ENV] Draw. Reason: {termination_reason}, Steps: {self.current_step}")
         else:
             reward_scalar = 0.0
         
