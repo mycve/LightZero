@@ -231,9 +231,8 @@ class GPUInferenceServer:
         self._policy_config = policy_config
         self._logger = logger
         
-        # 使用LOCAL_RANK获取设备（DDP环境下最可靠）
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        self._device = torch.device(f'cuda:{local_rank}')
+        # 获取设备 - 多种方式确保正确
+        self._device = self._determine_device(policy, policy_config)
         
         self._running = False
         self._thread = None
@@ -243,7 +242,42 @@ class GPUInferenceServer:
         self._total_inference_time = 0.0
         
         if self._logger:
-            self._logger.info(f"GPUInferenceServer 使用设备: {self._device} (LOCAL_RANK={local_rank})")
+            self._logger.info(f"GPUInferenceServer 使用设备: {self._device}")
+    
+    def _determine_device(self, policy, policy_config):
+        """
+        确定推理设备 - 按优先级尝试多种方式
+        """
+        # 方式1: 从 torch.cuda.current_device() 获取（DDPContext 会设置）
+        try:
+            if torch.cuda.is_available():
+                current_dev = torch.cuda.current_device()
+                device = torch.device(f'cuda:{current_dev}')
+                if self._logger:
+                    self._logger.info(f"设备来源: torch.cuda.current_device() = {current_dev}")
+                return device
+        except Exception as e:
+            if self._logger:
+                self._logger.warning(f"torch.cuda.current_device() 失败: {e}")
+        
+        # 方式2: 从 policy_config.device 获取
+        try:
+            cfg_device = getattr(policy_config, 'device', None)
+            if cfg_device and str(cfg_device) != 'cuda':
+                device = torch.device(cfg_device)
+                if self._logger:
+                    self._logger.info(f"设备来源: policy_config.device = {cfg_device}")
+                return device
+        except Exception as e:
+            if self._logger:
+                self._logger.warning(f"policy_config.device 获取失败: {e}")
+        
+        # 方式3: 从环境变量获取
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        device = torch.device(f'cuda:{local_rank}')
+        if self._logger:
+            self._logger.info(f"设备来源: LOCAL_RANK = {local_rank}")
+        return device
         
     def start(self):
         """启动推理服务器线程"""

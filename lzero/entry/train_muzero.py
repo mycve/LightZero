@@ -66,7 +66,11 @@ def train_muzero(
         from lzero.mcts import StochasticMuZeroGameBuffer as GameBuffer
 
     if cfg.policy.cuda and torch.cuda.is_available():
-        cfg.policy.device = 'cuda'
+        # DDP环境下使用LOCAL_RANK确定具体设备
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        cfg.policy.device = f'cuda:{local_rank}'
+        # 确保当前进程使用正确的CUDA设备
+        torch.cuda.set_device(local_rank)
     else:
         cfg.policy.device = 'cpu'
 
