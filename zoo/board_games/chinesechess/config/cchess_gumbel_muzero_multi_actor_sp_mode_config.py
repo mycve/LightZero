@@ -53,7 +53,13 @@ cchess_gumbel_muzero_multi_actor_config = dict(
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
         n_evaluator_episode=evaluator_env_num,
-        manager=dict(shared_memory=False),
+        manager=dict(
+            shared_memory=False,
+            copy_on_get=True,
+            context='spawn',
+            retry_type='renew',
+            max_retry=2,
+        ),
         # 游戏规则
         max_episode_steps=max_episode_steps,
         draw_as_loss=True,
