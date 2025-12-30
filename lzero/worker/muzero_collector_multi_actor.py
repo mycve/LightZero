@@ -231,17 +231,9 @@ class GPUInferenceServer:
         self._policy_config = policy_config
         self._logger = logger
         
-        # 从模型参数获取实际设备（支持多卡DDP）
-        # policy_config.device 可能是 'cuda' 而不是 'cuda:4'，导致设备不匹配
-        self._device = self._get_model_device(policy, policy_config)
-        
-        if self._logger:
-            self._logger.info(f"GPUInferenceServer 使用设备: {self._device}")
-    
-    def _get_model_device(self, policy, policy_config):
-        """获取模型所在的实际设备（已弃用，使用_do_inference中的逻辑）"""
+        # 使用LOCAL_RANK获取设备（DDP环境下最可靠）
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        return torch.device(f'cuda:{local_rank}')
+        self._device = torch.device(f'cuda:{local_rank}')
         
         self._running = False
         self._thread = None
@@ -249,6 +241,9 @@ class GPUInferenceServer:
         # 统计信息
         self._total_inferences = 0
         self._total_inference_time = 0.0
+        
+        if self._logger:
+            self._logger.info(f"GPUInferenceServer 使用设备: {self._device} (LOCAL_RANK={local_rank})")
         
     def start(self):
         """启动推理服务器线程"""
@@ -319,18 +314,8 @@ class GPUInferenceServer:
         """
         执行推理 - 从共享内存读取数据，结果写入共享内存
         """
-        # 直接从模型参数获取设备（最可靠的方式）
-        try:
-            model = self._policy._collect_model
-            if hasattr(model, 'module'):
-                model = model.module
-            device = next(model.parameters()).device
-        except Exception as e:
-            # 如果获取失败，打印详细错误并使用回退方案
-            local_rank = int(os.environ.get('LOCAL_RANK', 0))
-            device = torch.device(f'cuda:{local_rank}')
-            if self._logger:
-                self._logger.warning(f"获取模型设备失败({e})，使用LOCAL_RANK={local_rank}")
+        # 使用初始化时确定的设备
+        device = self._device
         
         # 从共享内存读取obs
         obs_buffer = self._shared_obs_buffer.get_buffer(request.actor_id)
