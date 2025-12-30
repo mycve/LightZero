@@ -233,23 +233,15 @@ class GPUInferenceServer:
         
         # 从模型参数获取实际设备（支持多卡DDP）
         # policy_config.device 可能是 'cuda' 而不是 'cuda:4'，导致设备不匹配
-        try:
-            self._device = next(policy._collect_model.parameters()).device
-            if self._logger:
-                self._logger.info(f"GPUInferenceServer 从模型参数获取设备: {self._device}")
-        except (StopIteration, AttributeError) as e:
-            # 回退方案：使用当前CUDA设备
-            if torch.cuda.is_available():
-                current_device = torch.cuda.current_device()
-                self._device = f'cuda:{current_device}'
-            else:
-                self._device = policy_config.device
-            if self._logger:
-                self._logger.warning(f"无法从模型获取设备({e})，使用: {self._device}")
+        self._device = self._get_model_device(policy, policy_config)
         
         if self._logger:
-            self._logger.info(f"GPUInferenceServer 最终使用设备: {self._device}, "
-                            f"policy_config.device={policy_config.device}")
+            self._logger.info(f"GPUInferenceServer 使用设备: {self._device}")
+    
+    def _get_model_device(self, policy, policy_config):
+        """获取模型所在的实际设备（已弃用，使用_do_inference中的逻辑）"""
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        return torch.device(f'cuda:{local_rank}')
         
         self._running = False
         self._thread = None
@@ -327,9 +319,22 @@ class GPUInferenceServer:
         """
         执行推理 - 从共享内存读取数据，结果写入共享内存
         """
+        # 直接从模型参数获取设备（最可靠的方式）
+        try:
+            model = self._policy._collect_model
+            if hasattr(model, 'module'):
+                model = model.module
+            device = next(model.parameters()).device
+        except Exception as e:
+            # 如果获取失败，打印详细错误并使用回退方案
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            device = torch.device(f'cuda:{local_rank}')
+            if self._logger:
+                self._logger.warning(f"获取模型设备失败({e})，使用LOCAL_RANK={local_rank}")
+        
         # 从共享内存读取obs
         obs_buffer = self._shared_obs_buffer.get_buffer(request.actor_id)
-        stack_obs = obs_buffer[:request.batch_size].to(self._device)
+        stack_obs = obs_buffer[:request.batch_size].to(device)
         
         # 调用policy.forward()
         policy_output = self._policy.forward(
