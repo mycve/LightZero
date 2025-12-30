@@ -186,6 +186,7 @@ def train_muzero_multi_actor(
         policy_config=policy_config,
         env_fn=env_fn,                    # 环境创建函数
         env_config=collector_env_cfg,     # 环境配置列表
+        env_manager_cfg=cfg.env.manager,  # env_manager完整配置
     )
     
     evaluator = Evaluator(
