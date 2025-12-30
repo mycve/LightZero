@@ -1,8 +1,17 @@
 """
-中国象棋 EfficientZero 多Actor并行采集配置
+中国象棋 EfficientZero 多进程并行采集配置
 
-使用 MultiActorMuZeroCollector 实现多Actor并行采集，提升GPU利用率。
-结合 EfficientZero 的自监督学习损失。
+使用 MultiActorMuZeroCollector 实现多进程并行采集:
+- 真正的多进程并行，绕过GIL限制
+- 共享内存零拷贝，无序列化开销
+- GPU持续推理，充分利用硬件性能
+
+EfficientZero 特有:
+- 自监督学习损失
+- 更好的样本效率
+
+支持多卡DDP训练:
+- 设置 use_multi_gpu=True 和 gpu_num=8
 """
 
 from easydict import EasyDict
@@ -12,18 +21,20 @@ from zoo.board_games.chinesechess.envs.action_mapping import ACTION_SPACE_SIZE
 # 常用配置参数
 # ==============================================================
 
-use_multi_gpu = False
-gpu_num = 1
+# 多GPU配置（8卡DDP）
+use_multi_gpu = True
+gpu_num = 8
 
 # 多Actor配置
-n_actors = 8
-envs_per_actor = 16
-collector_env_num = n_actors * envs_per_actor
+n_actors = 4                     # 每张卡的Actor进程数量
+envs_per_actor = 512              # 每个Actor管理的环境数量
+
+collector_env_num = n_actors * envs_per_actor  # 64 per GPU
 n_episode = collector_env_num
 
 evaluator_env_num = 3
 num_simulations = 50
-batch_size = 256
+batch_size = 512
 update_per_collect = 50
 reanalyze_ratio = 0.0
 max_env_step = int(1e7)
@@ -33,8 +44,8 @@ max_episode_steps = 200
 # 配置结束
 # ==============================================================
 
-cchess_efficientzero_multi_actor_config = dict(
-    exp_name=f'data_efficientzero/cchess_efficientzero_multi_actor_sp-mode_actors{n_actors}_envs{envs_per_actor}_ns{num_simulations}_seed0',
+cchess_efficientzero_config = dict(
+    exp_name=f'data_efficientzero/cchess_efficientzero_{gpu_num}gpu_actors{n_actors}_envs{envs_per_actor}_ns{num_simulations}_seed0',
     env=dict(
         battle_mode='self_play_mode',
         channel_last=False,
@@ -90,35 +101,57 @@ cchess_efficientzero_multi_actor_config = dict(
     ),
 )
 
-cchess_efficientzero_multi_actor_config = EasyDict(cchess_efficientzero_multi_actor_config)
-main_config = cchess_efficientzero_multi_actor_config
+cchess_efficientzero_config = EasyDict(cchess_efficientzero_config)
+main_config = cchess_efficientzero_config
 
-cchess_efficientzero_multi_actor_create_config = dict(
+cchess_efficientzero_create_config = dict(
     env=dict(
         type='cchess',
         import_names=['zoo.board_games.chinesechess.envs.cchess_env'],
     ),
-    env_manager=dict(type='subprocess'),
+    # Actor已经是独立进程，内部env_manager用base更高效
+    env_manager=dict(type='base'),
     policy=dict(
         type='efficientzero',
         import_names=['lzero.policy.efficientzero'],
     ),
-    collector=dict(
-        type='multi_actor_muzero',
-        import_names=['lzero.worker.muzero_collector_multi_actor'],
-    )
 )
 
-cchess_efficientzero_multi_actor_create_config = EasyDict(cchess_efficientzero_multi_actor_create_config)
-create_config = cchess_efficientzero_multi_actor_create_config
+cchess_efficientzero_create_config = EasyDict(cchess_efficientzero_create_config)
+create_config = cchess_efficientzero_create_config
 
 
 if __name__ == "__main__":
-    from zoo.board_games.gomoku.entry.train_muzero_multi_actor import train_muzero_multi_actor
+    """
+    8卡DDP训练: torchrun --nproc_per_node=8 此文件
+    """
+    from ding.utils import DDPContext
+    from lzero.entry import train_muzero
+    from lzero.config.utils import lz_to_ddp_config
     
-    train_muzero_multi_actor(
-        [main_config, create_config],
-        seed=0,
-        model_path=main_config.policy.model_path,
-        max_env_step=max_env_step
-    )
+    import numpy as np
+    from ding.worker import BaseLearner
+
+    def _sanitize_log_buffer(data):
+        if isinstance(data, dict):
+            return {k: _sanitize_log_buffer(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [_sanitize_log_buffer(v) for v in data]
+        elif isinstance(data, np.ndarray):
+            return data.item() if data.size == 1 else data.tolist()
+        return data
+
+    _orig_call_hook = BaseLearner.call_hook
+    def _patched_call_hook(self, place: str):
+        if place == 'after_iter' and getattr(self, 'log_buffer', None) is not None:
+            try:
+                self.log_buffer = _sanitize_log_buffer(self.log_buffer)
+            except:
+                pass
+        return _orig_call_hook(self, place)
+    BaseLearner.call_hook = _patched_call_hook
+
+    seed = 0
+    with DDPContext():
+        main_config = lz_to_ddp_config(main_config)
+        train_muzero([main_config, create_config], seed=seed, max_env_step=max_env_step)

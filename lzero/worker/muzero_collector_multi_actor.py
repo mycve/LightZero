@@ -1,34 +1,38 @@
 """
-多Actor并行采集器 - 通用设计，支持所有MuZero系列算法
+多Actor并行采集器 - 多进程 + 共享内存实现
 
 架构设计:
 ┌─────────────────────────────────────────────────────────────────────┐
-│  MultiActorMuZeroCollector (主协调器)                                │
-│      ├── GPUInferenceServer (单独线程，处理GPU推理)                   │
+│  MultiActorMuZeroCollector (主进程)                                  │
+│      ├── SharedObsBuffer (共享内存，存储obs)                         │
+│      ├── SharedResponseBuffer (共享内存，存储推理结果)               │
+│      ├── GPUInferenceServer (主进程线程，处理GPU推理)                │
 │      │       └── policy.forward()                                   │
 │      │                                                              │
-│      └── ActorWorker × N (多线程)                                    │
-│              └── EnvManager (每个Actor管理自己的envs)                 │
+│      └── ActorProcess × N (独立进程)                                 │
+│              └── EnvManager (每个Actor管理自己的envs)                │
 │                                                                     │
 │  工作流程:                                                           │
-│  1. 每个ActorWorker独立运行自己的envs                                 │
-│  2. 当某个Actor的所有envs ready时，将obs放入推理队列                   │
-│  3. GPUInferenceServer从队列取出请求，执行推理，返回结果               │
-│  4. Actor收到结果后执行actions，继续循环                              │
-│  5. 数据汇总到共享的game_segment_pool                                │
+│  1. 每个ActorProcess独立运行自己的envs                               │
+│  2. Actor将obs写入共享内存，通过Queue发送元数据                       │
+│  3. GPUInferenceServer从共享内存读取数据，执行推理                    │
+│  4. 结果写入共享内存，Actor从共享内存读取结果                         │
+│  5. 全程零拷贝，无序列化开销                                         │
 └─────────────────────────────────────────────────────────────────────┘
 
 优势:
+- 真正的多进程并行，绕过GIL限制
+- 共享内存零拷贝，无序列化开销
 - GPU不再空闲等待，总有Actor ready可以推理
-- 绕过单核CPU性能瓶颈
 - 通用设计，支持所有MuZero系列算法
 """
 
 import os
 import time
 import copy
-import queue
-import threading
+import logging
+import traceback
+import multiprocessing as mp
 from collections import deque, namedtuple
 from typing import Optional, Any, List, Dict, Callable, Tuple, Union
 from dataclasses import dataclass, field
@@ -36,11 +40,12 @@ from functools import partial
 
 import numpy as np
 import torch
+import torch.multiprocessing as torch_mp
 import wandb
 from easydict import EasyDict
 from ding.envs import BaseEnvManager, create_env_manager
 from ding.torch_utils import to_ndarray
-from ding.utils import build_logger, EasyTimer, SERIAL_COLLECTOR_REGISTRY, get_rank, get_world_size, allreduce_data
+from ding.utils import build_logger, EasyTimer, SERIAL_COLLECTOR_REGISTRY, get_rank, get_world_size
 from ding.worker.collector.base_serial_collector import ISerialCollector
 from torch.nn import L1Loss
 
@@ -49,29 +54,131 @@ from lzero.mcts.utils import prepare_observation
 
 
 # =============================================================================
-# 数据结构定义
+# 共享内存缓冲区
+# =============================================================================
+
+class SharedObsBuffer:
+    """
+    共享内存观察缓冲区 - 实现进程间零拷贝数据传输
+    
+    设计要点:
+    - 每个Actor预分配固定大小缓冲区
+    - 使用 torch.Tensor.share_memory_() 实现共享内存
+    - Actor写入obs后，推理服务器直接读取，无需拷贝
+    """
+    
+    def __init__(self, n_actors: int, max_batch_size: int, obs_shape: tuple):
+        """
+        Args:
+            n_actors: Actor数量
+            max_batch_size: 每个Actor最大batch大小（通常等于envs_per_actor）
+            obs_shape: 单个观察的shape，如 (4, 96, 96) for Atari, (56, 10, 9) for Chinese Chess
+        """
+        self.n_actors = n_actors
+        self.max_batch_size = max_batch_size
+        self.obs_shape = obs_shape
+        
+        # 为每个Actor预分配共享内存缓冲区
+        # buffer_shape: [max_batch_size, *obs_shape]
+        self.buffers = {}
+        for actor_id in range(n_actors):
+            buffer = torch.zeros(max_batch_size, *obs_shape, dtype=torch.float32)
+            buffer.share_memory_()  # 关键：移动到共享内存
+            self.buffers[actor_id] = buffer
+        
+        logging.info(f"SharedObsBuffer 初始化完成: n_actors={n_actors}, "
+                    f"max_batch_size={max_batch_size}, obs_shape={obs_shape}, "
+                    f"单个缓冲区大小={max_batch_size * np.prod(obs_shape) * 4 / 1024 / 1024:.2f}MB")
+    
+    def get_buffer(self, actor_id: int) -> torch.Tensor:
+        """获取Actor的缓冲区"""
+        return self.buffers[actor_id]
+
+
+class SharedResponseBuffer:
+    """
+    共享内存响应缓冲区 - 存储推理结果
+    
+    存储内容:
+    - actions: 动作
+    - searched_values: MCTS搜索值
+    - predicted_values: 预测值
+    - visit_count_distributions: 访问分布
+    """
+    
+    def __init__(self, n_actors: int, max_batch_size: int, action_space_size: int):
+        """
+        Args:
+            n_actors: Actor数量
+            max_batch_size: 每个Actor最大batch大小
+            action_space_size: 动作空间大小
+        """
+        self.n_actors = n_actors
+        self.max_batch_size = max_batch_size
+        self.action_space_size = action_space_size
+        
+        self.buffers = {}
+        for actor_id in range(n_actors):
+            # actions: [max_batch_size]
+            actions = torch.zeros(max_batch_size, dtype=torch.long)
+            actions.share_memory_()
+            
+            # searched_values: [max_batch_size]
+            searched_values = torch.zeros(max_batch_size, dtype=torch.float32)
+            searched_values.share_memory_()
+            
+            # predicted_values: [max_batch_size]
+            predicted_values = torch.zeros(max_batch_size, dtype=torch.float32)
+            predicted_values.share_memory_()
+            
+            # visit_count_distributions: [max_batch_size, action_space_size]
+            visit_counts = torch.zeros(max_batch_size, action_space_size, dtype=torch.float32)
+            visit_counts.share_memory_()
+            
+            # visit_entropy: [max_batch_size]
+            visit_entropy = torch.zeros(max_batch_size, dtype=torch.float32)
+            visit_entropy.share_memory_()
+            
+            self.buffers[actor_id] = {
+                'actions': actions,
+                'searched_values': searched_values, 
+                'predicted_values': predicted_values,
+                'visit_counts': visit_counts,
+                'visit_entropy': visit_entropy,
+            }
+        
+        logging.info(f"SharedResponseBuffer 初始化完成: n_actors={n_actors}, "
+                    f"action_space_size={action_space_size}")
+    
+    def get_buffer(self, actor_id: int) -> Dict[str, torch.Tensor]:
+        """获取Actor的响应缓冲区"""
+        return self.buffers[actor_id]
+
+
+# =============================================================================
+# 数据结构定义 - 只传元数据，不传实际数据
 # =============================================================================
 
 @dataclass
 class InferenceRequest:
-    """推理请求数据结构"""
+    """推理请求 - 只包含元数据，实际数据在共享内存中"""
     actor_id: int                          # Actor ID
     request_id: int                        # 请求ID（用于匹配响应）
-    stack_obs: torch.Tensor                # 批量观察 [B, C, H, W]
-    action_mask: List                      # 动作掩码
+    batch_size: int                        # 实际batch大小
+    action_mask: List                      # 动作掩码（较小，直接传）
     to_play: List                          # 当前玩家
     temperature: float                     # 温度参数
     epsilon: float                         # epsilon参数
-    ready_env_id: np.ndarray               # ready环境ID
+    ready_env_id: List[int]                # ready环境ID列表
     timestep: List = field(default_factory=list)  # 时间步（用于UniZero）
 
 
 @dataclass 
 class InferenceResponse:
-    """推理响应数据结构"""
+    """推理响应 - 只包含元数据，实际数据在共享内存中"""
     actor_id: int                          # Actor ID
     request_id: int                        # 请求ID
-    policy_output: Dict                    # policy.forward()的输出
+    batch_size: int                        # batch大小
 
 
 @dataclass
@@ -83,47 +190,50 @@ class CollectedSegment:
 
 
 # =============================================================================
-# GPU推理服务器
+# GPU推理服务器 - 在主进程中运行
 # =============================================================================
 
 class GPUInferenceServer:
     """
-    GPU推理服务器 - 独立线程运行
+    GPU推理服务器 - 在主进程的独立线程中运行
     
     功能:
-    - 从请求队列中获取推理请求
+    - 从共享内存读取obs
     - 调用policy.forward()执行推理
-    - 将结果放入对应的响应队列
-    
-    设计要点:
-    - 线程安全
-    - 支持任意policy（MuZero, EfficientZero, Gumbel等）
+    - 将结果写入共享内存
     """
     
     def __init__(
         self,
         policy: namedtuple,
-        request_queue: queue.Queue,
-        response_queues: Dict[int, queue.Queue],  # actor_id -> response_queue
+        shared_obs_buffer: SharedObsBuffer,
+        shared_response_buffer: SharedResponseBuffer,
+        request_queue: mp.Queue,
+        response_queues: Dict[int, mp.Queue],
         policy_config: Any,
         logger: Any = None,
     ):
         """
         Args:
-            policy: policy.collect_mode，支持forward方法
+            policy: policy.collect_mode
+            shared_obs_buffer: 共享内存obs缓冲区
+            shared_response_buffer: 共享内存响应缓冲区
             request_queue: 推理请求队列
-            response_queues: 每个Actor的响应队列 {actor_id: queue}
+            response_queues: 每个Actor的响应队列
             policy_config: 策略配置
             logger: 日志器
         """
         self._policy = policy
+        self._shared_obs_buffer = shared_obs_buffer
+        self._shared_response_buffer = shared_response_buffer
         self._request_queue = request_queue
         self._response_queues = response_queues
         self._policy_config = policy_config
         self._logger = logger
+        self._device = policy_config.device
         
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._thread = None
         
         # 统计信息
         self._total_inferences = 0
@@ -131,43 +241,51 @@ class GPUInferenceServer:
         
     def start(self):
         """启动推理服务器线程"""
+        import threading
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True, name="GPUInferenceServer")
         self._thread.start()
         if self._logger:
-            self._logger.info("GPUInferenceServer started")
+            self._logger.info("GPUInferenceServer 启动")
             
     def stop(self):
         """停止推理服务器"""
         self._running = False
         if self._thread:
             # 放入一个None来唤醒阻塞的get
-            self._request_queue.put(None)
+            try:
+                self._request_queue.put(None)
+            except:
+                pass
             self._thread.join(timeout=5.0)
         if self._logger:
-            self._logger.info(f"GPUInferenceServer stopped. Total inferences: {self._total_inferences}, "
-                            f"Avg time: {self._total_inference_time / max(1, self._total_inferences):.4f}s")
+            avg_time = self._total_inference_time / max(1, self._total_inferences)
+            self._logger.info(f"GPUInferenceServer 停止. 总推理次数: {self._total_inferences}, "
+                            f"平均耗时: {avg_time:.4f}s")
     
     def _run(self):
         """推理服务器主循环"""
         while self._running:
             try:
                 # 从队列获取请求，带超时避免死锁
-                request: Optional[InferenceRequest] = self._request_queue.get(timeout=0.1)
+                try:
+                    request: Optional[InferenceRequest] = self._request_queue.get(timeout=0.1)
+                except:
+                    continue
                 
                 if request is None:
                     continue
                     
                 start_time = time.time()
                 
-                # 执行推理
-                policy_output = self._do_inference(request)
+                # 从共享内存读取obs并执行推理
+                self._do_inference(request)
                 
-                # 构建响应
+                # 构建响应（只包含元数据）
                 response = InferenceResponse(
                     actor_id=request.actor_id,
                     request_id=request.request_id,
-                    policy_output=policy_output
+                    batch_size=request.batch_size
                 )
                 
                 # 放入对应Actor的响应队列
@@ -175,513 +293,567 @@ class GPUInferenceServer:
                     self._response_queues[request.actor_id].put(response)
                 else:
                     if self._logger:
-                        self._logger.error(f"Unknown actor_id: {request.actor_id}")
+                        self._logger.error(f"未知的actor_id: {request.actor_id}")
                 
                 # 更新统计
                 self._total_inferences += 1
                 self._total_inference_time += time.time() - start_time
                 
-            except queue.Empty:
-                continue
             except Exception as e:
                 if self._logger:
-                    self._logger.error(f"GPUInferenceServer error: {e}")
-                import traceback
+                    self._logger.error(f"GPUInferenceServer 错误: {e}")
                 traceback.print_exc()
     
-    def _do_inference(self, request: InferenceRequest) -> Dict:
+    def _do_inference(self, request: InferenceRequest):
         """
-        执行推理 - 调用policy.forward()
+        执行推理 - 从共享内存读取数据，结果写入共享内存
+        """
+        # 从共享内存读取obs（零拷贝）
+        obs_buffer = self._shared_obs_buffer.get_buffer(request.actor_id)
+        stack_obs = obs_buffer[:request.batch_size].to(self._device)
         
-        这个方法是通用的，支持所有MuZero系列算法
-        """
+        # 调用policy.forward()
         policy_output = self._policy.forward(
-            request.stack_obs,
+            stack_obs,
             request.action_mask,
             request.temperature,
             request.to_play,
             request.epsilon,
-            ready_env_id=request.ready_env_id,
+            ready_env_id=np.array(request.ready_env_id),
             timestep=request.timestep
         )
-        return policy_output
+        
+        # 将结果写入共享内存（零拷贝）
+        resp_buffer = self._shared_response_buffer.get_buffer(request.actor_id)
+        
+        for i, env_id in enumerate(request.ready_env_id):
+            output = policy_output[env_id]
+            resp_buffer['actions'][i] = output['action']
+            resp_buffer['searched_values'][i] = output['searched_value']
+            resp_buffer['predicted_values'][i] = output['predicted_value']
+            
+            if 'visit_count_distributions' in output:
+                visit_dist = output['visit_count_distributions']
+                resp_buffer['visit_counts'][i, :len(visit_dist)] = torch.tensor(visit_dist, dtype=torch.float32)
+            
+            if 'visit_count_distribution_entropy' in output:
+                resp_buffer['visit_entropy'][i] = output['visit_count_distribution_entropy']
 
 
 # =============================================================================
-# Actor Worker - 单个Actor的工作逻辑
+# Actor进程入口函数
 # =============================================================================
 
-class ActorWorker:
+def _actor_process_main(
+    actor_id: int,
+    env_fn: Callable,
+    env_configs: List[dict],
+    env_manager_cfg: dict,
+    policy_config_dict: dict,
+    shared_obs_buffer: SharedObsBuffer,
+    shared_response_buffer: SharedResponseBuffer,
+    request_queue: mp.Queue,
+    response_queue: mp.Queue,
+    segment_queue: mp.Queue,
+    stop_event: mp.Event,
+    n_episode: int,
+    temperature: float,
+    epsilon: float,
+    seed: int,
+):
     """
-    单个Actor Worker - 管理自己的一组envs
+    Actor子进程入口函数
     
-    功能:
-    - 管理自己的env_manager和game_segments
-    - 当envs全部ready时，发送推理请求
-    - 接收推理结果，执行actions
-    - 收集game_segment数据
-    
-    设计要点:
-    - 与MuZeroCollector的核心逻辑保持一致
-    - 通过队列与GPUInferenceServer通信
+    Args:
+        actor_id: Actor ID
+        env_fn: 环境创建函数
+        env_configs: 该Actor管理的环境配置列表
+        env_manager_cfg: env_manager配置
+        policy_config_dict: 策略配置（字典形式，可序列化）
+        shared_obs_buffer: 共享内存obs缓冲区
+        shared_response_buffer: 共享内存响应缓冲区
+        request_queue: 请求队列
+        response_queue: 响应队列
+        segment_queue: segment数据队列
+        stop_event: 停止信号
+        n_episode: 需要收集的episode数量
+        temperature: 温度参数
+        epsilon: epsilon参数
+        seed: 随机种子
     """
+    try:
+        # 设置进程名
+        import setproctitle
+        setproctitle.setproctitle(f"LightZero-Actor-{actor_id}")
+    except ImportError:
+        pass
     
-    def __init__(
-        self,
-        actor_id: int,
-        env: BaseEnvManager,
-        request_queue: queue.Queue,
-        response_queue: queue.Queue,
-        segment_queue: queue.Queue,  # 收集到的segment放入此队列
-        policy_config: Any,
-        policy_reset_fn: Callable,   # policy.reset的函数
-        logger: Any = None,
-    ):
-        """
-        Args:
-            actor_id: Actor的唯一ID
-            env: 该Actor管理的env_manager
-            request_queue: 发送推理请求的队列
-            response_queue: 接收推理响应的队列
-            segment_queue: 收集到的segment放入此队列
-            policy_config: 策略配置
-            policy_reset_fn: policy.reset的函数（用于重置policy状态）
-            logger: 日志器
-        """
-        self._actor_id = actor_id
-        self._env = env
-        self._request_queue = request_queue
-        self._response_queue = response_queue
-        self._segment_queue = segment_queue
-        self._policy_config = policy_config
-        self._policy_reset_fn = policy_reset_fn
-        self._logger = logger
+    # 转换配置为EasyDict
+    policy_config = EasyDict(policy_config_dict)
+    
+    logging.info(f"[Actor-{actor_id}] 进程启动, PID={os.getpid()}")
+    
+    try:
+        # 在子进程中创建环境
+        env_manager_cfg_copy = copy.deepcopy(env_manager_cfg)
+        if not isinstance(env_manager_cfg_copy, EasyDict):
+            env_manager_cfg_copy = EasyDict(env_manager_cfg_copy)
         
-        # 环境信息
-        self._env_num = self._env.env_num
+        # 默认使用base（同步），因为Actor已经是独立进程
+        if 'type' not in env_manager_cfg_copy:
+            env_manager_cfg_copy['type'] = 'base'
         
-        # 请求计数器
-        self._request_counter = 0
+        env_type = env_manager_cfg_copy.get('type', 'base')
         
-        # 运行状态
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
+        # 根据env_manager类型添加必要的默认配置
+        if env_type == 'subprocess':
+            subprocess_defaults = {
+                'episode_num': float('inf'),
+                'max_retry': 1,
+                'retry_type': 'reset',
+                'auto_reset': True,
+                'step_timeout': None,
+                'reset_timeout': None,
+                'retry_waiting_time': 0.1,
+                'copy_on_get': True,
+                'context': 'spawn',
+                'wait_num': float('inf'),
+                'step_wait_timeout': None,
+                'connect_timeout': 60,
+                'reset_inplace': False,
+            }
+            for key, value in subprocess_defaults.items():
+                if key not in env_manager_cfg_copy:
+                    env_manager_cfg_copy[key] = value
+        else:
+            # base env_manager 默认配置
+            base_defaults = {
+                'episode_num': float('inf'),
+                'max_retry': 1,
+                'retry_type': 'reset',
+                'auto_reset': True,
+                'reset_timeout': None,
+            }
+            for key, value in base_defaults.items():
+                if key not in env_manager_cfg_copy:
+                    env_manager_cfg_copy[key] = value
         
-        # 统计信息
-        self._total_episodes = 0
-        self._total_steps = 0
-        
-        # 配置参数
-        self.unroll_plus_td_steps = policy_config.num_unroll_steps + policy_config.td_steps
-        
-    def start(self, n_episode: int, temperature: float, epsilon: float):
-        """
-        启动Actor Worker线程
-        
-        Args:
-            n_episode: 需要收集的episode数量
-            temperature: 温度参数
-            epsilon: epsilon参数
-        """
-        self._running = True
-        self._target_episodes = n_episode
-        self._temperature = temperature
-        self._epsilon = epsilon
-        self._collected_episodes = 0
-        
-        self._thread = threading.Thread(
-            target=self._run, 
-            daemon=True, 
-            name=f"ActorWorker-{self._actor_id}"
+        env = create_env_manager(
+            env_manager_cfg_copy,
+            [partial(env_fn, cfg=c) for c in env_configs]
         )
-        self._thread.start()
+        env.seed(seed + actor_id * 1000)
+        env.launch()
         
-    def stop(self):
-        """停止Actor Worker"""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=10.0)
-            
-    def is_alive(self) -> bool:
-        """检查线程是否存活"""
-        return self._thread is not None and self._thread.is_alive()
-    
-    def is_done(self) -> bool:
-        """检查是否完成收集任务"""
-        return self._collected_episodes >= self._target_episodes
-    
-    def _run(self):
-        """Actor Worker主循环"""
+        env_num = env.env_num
+        logging.info(f"[Actor-{actor_id}] 环境创建完成, env_num={env_num}")
+        
+        # 获取共享内存缓冲区
+        obs_buffer = shared_obs_buffer.get_buffer(actor_id)
+        resp_buffer = shared_response_buffer.get_buffer(actor_id)
+        
+        # 运行收集循环
+        _actor_collect_loop(
+            actor_id=actor_id,
+            env=env,
+            policy_config=policy_config,
+            obs_buffer=obs_buffer,
+            resp_buffer=resp_buffer,
+            request_queue=request_queue,
+            response_queue=response_queue,
+            segment_queue=segment_queue,
+            stop_event=stop_event,
+            n_episode=n_episode,
+            temperature=temperature,
+            epsilon=epsilon,
+        )
+        
+    except Exception as e:
+        logging.error(f"[Actor-{actor_id}] 进程异常: {e}")
+        traceback.print_exc()
+        # 发送错误信号
+        segment_queue.put(('ERROR', actor_id, str(e)))
+    finally:
         try:
-            self._collect_loop()
-        except Exception as e:
-            if self._logger:
-                self._logger.error(f"ActorWorker-{self._actor_id} error: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self._running = False
+            env.close()
+        except:
+            pass
+        logging.info(f"[Actor-{actor_id}] 进程退出")
+
+
+def _actor_collect_loop(
+    actor_id: int,
+    env: BaseEnvManager,
+    policy_config: EasyDict,
+    obs_buffer: torch.Tensor,
+    resp_buffer: Dict[str, torch.Tensor],
+    request_queue: mp.Queue,
+    response_queue: mp.Queue,
+    segment_queue: mp.Queue,
+    stop_event: mp.Event,
+    n_episode: int,
+    temperature: float,
+    epsilon: float,
+):
+    """
+    Actor数据收集主循环
+    """
+    env_num = env.env_num
+    request_counter = 0
+    collected_episodes = 0
+    total_steps = 0
+    
+    unroll_plus_td_steps = policy_config.num_unroll_steps + policy_config.td_steps
+    
+    # ============ 初始化 ============
+    init_obs = env.ready_obs
+    retry_count = 0
+    while len(init_obs.keys()) != env_num and retry_count < 100:
+        time.sleep(0.01)
+        init_obs = env.ready_obs
+        retry_count += 1
+        
+    if len(init_obs.keys()) != env_num:
+        raise RuntimeError(f"[Actor-{actor_id}] 无法获取所有环境obs, "
+                         f"got {len(init_obs.keys())}, expected {env_num}")
+    
+    # 初始化数据结构
+    action_mask_dict = {i: to_ndarray(init_obs[i]['action_mask']) for i in range(env_num)}
+    to_play_dict = {i: to_ndarray(init_obs[i]['to_play']) for i in range(env_num)}
+    timestep_dict = {i: to_ndarray(init_obs[i].get('timestep', -1)) for i in range(env_num)}
+    
+    if policy_config.use_ture_chance_label_in_chance_encoder:
+        chance_dict = {i: to_ndarray(init_obs[i]['chance']) for i in range(env_num)}
+    
+    # 创建GameSegment
+    game_segments = [
+        GameSegment(
+            env.action_space,
+            game_segment_length=policy_config.game_segment_length,
+            config=policy_config
+        ) for _ in range(env_num)
+    ]
+    
+    # 观察窗口栈
+    observation_window_stack = [
+        deque(
+            [to_ndarray(init_obs[env_id]['observation']) 
+             for _ in range(policy_config.model.frame_stack_num)],
+            maxlen=policy_config.model.frame_stack_num
+        ) for env_id in range(env_num)
+    ]
+    
+    for env_id in range(env_num):
+        game_segments[env_id].reset(observation_window_stack[env_id])
+    
+    dones = np.array([False for _ in range(env_num)])
+    last_game_segments = [None for _ in range(env_num)]
+    last_game_priorities = [None for _ in range(env_num)]
+    
+    # 优先级计算相关
+    search_values_lst = [[] for _ in range(env_num)]
+    pred_values_lst = [[] for _ in range(env_num)]
+    
+    # 统计信息
+    eps_steps_lst = np.zeros(env_num)
+    visit_entropies_lst = np.zeros(env_num)
+    
+    ready_env_id = set(range(env_num))
+    
+    logging.info(f"[Actor-{actor_id}] 开始收集循环, 目标episodes={n_episode}")
+    
+    # ============ 主循环 ============
+    while not stop_event.is_set() and collected_episodes < n_episode:
+        # 获取ready的obs
+        obs = env.ready_obs
+        
+        if len(obs) == 0:
+            time.sleep(0.001)
+            continue
             
-    def _collect_loop(self):
-        """
-        数据收集主循环 - 核心逻辑与MuZeroCollector.collect()保持一致
-        """
-        env_nums = self._env_num
+        current_ready_env_id = list(set(obs.keys()).intersection(ready_env_id))
+        if len(current_ready_env_id) == 0:
+            time.sleep(0.001)
+            continue
         
-        # ============ 初始化 ============
-        init_obs = self._env.ready_obs
-        retry_count = 0
-        while len(init_obs.keys()) != self._env_num and retry_count < 100:
-            time.sleep(0.01)
-            init_obs = self._env.ready_obs
-            retry_count += 1
-            
-        if len(init_obs.keys()) != self._env_num:
-            raise RuntimeError(f"ActorWorker-{self._actor_id}: Failed to get all env obs, "
-                             f"got {len(init_obs.keys())}, expected {self._env_num}")
+        batch_size = len(current_ready_env_id)
         
-        # 初始化数据结构
-        action_mask_dict = {i: to_ndarray(init_obs[i]['action_mask']) for i in range(env_nums)}
-        to_play_dict = {i: to_ndarray(init_obs[i]['to_play']) for i in range(env_nums)}
-        timestep_dict = {i: to_ndarray(init_obs[i].get('timestep', -1)) for i in range(env_nums)}
+        # 准备推理数据
+        stack_obs_list = [game_segments[env_id].get_obs() for env_id in current_ready_env_id]
+        action_mask = [action_mask_dict[env_id] for env_id in current_ready_env_id]
+        to_play = [to_play_dict[env_id] for env_id in current_ready_env_id]
+        timestep = [timestep_dict[env_id] for env_id in current_ready_env_id]
         
-        if self._policy_config.use_ture_chance_label_in_chance_encoder:
-            chance_dict = {i: to_ndarray(init_obs[i]['chance']) for i in range(env_nums)}
+        # 预处理观察数据
+        stack_obs_array = to_ndarray(stack_obs_list)
+        stack_obs_array = prepare_observation(stack_obs_array, policy_config.model.model_type)
+        stack_obs_tensor = torch.from_numpy(stack_obs_array).float()
         
-        # 创建GameSegment
-        game_segments = [
-            GameSegment(
-                self._env.action_space,
-                game_segment_length=self._policy_config.game_segment_length,
-                config=self._policy_config
-            ) for _ in range(env_nums)
-        ]
+        # ============ 写入共享内存 ============
+        obs_buffer[:batch_size].copy_(stack_obs_tensor)
         
-        # 观察窗口栈
-        observation_window_stack = [
-            deque(
-                [to_ndarray(init_obs[env_id]['observation']) 
-                 for _ in range(self._policy_config.model.frame_stack_num)],
-                maxlen=self._policy_config.model.frame_stack_num
-            ) for env_id in range(env_nums)
-        ]
+        # ============ 发送推理请求（只传元数据）============
+        request = InferenceRequest(
+            actor_id=actor_id,
+            request_id=request_counter,
+            batch_size=batch_size,
+            action_mask=action_mask,
+            to_play=to_play,
+            temperature=temperature,
+            epsilon=epsilon,
+            ready_env_id=current_ready_env_id,
+            timestep=timestep
+        )
+        request_counter += 1
+        request_queue.put(request)
         
-        for env_id in range(env_nums):
-            game_segments[env_id].reset(observation_window_stack[env_id])
+        # ============ 等待推理响应 ============
+        response: InferenceResponse = response_queue.get()
         
-        dones = np.array([False for _ in range(env_nums)])
-        last_game_segments = [None for _ in range(env_nums)]
-        last_game_priorities = [None for _ in range(env_nums)]
+        if response.request_id != request.request_id:
+            raise RuntimeError(f"[Actor-{actor_id}] 响应request_id不匹配: "
+                             f"expected {request.request_id}, got {response.request_id}")
         
-        # 优先级计算相关
-        search_values_lst = [[] for _ in range(env_nums)]
-        pred_values_lst = [[] for _ in range(env_nums)]
-        if self._policy_config.gumbel_algo:
-            improved_policy_lst = [[] for _ in range(env_nums)]
+        # ============ 从共享内存读取结果 ============
+        actions_array = resp_buffer['actions'][:batch_size].numpy().copy()
+        searched_values_array = resp_buffer['searched_values'][:batch_size].numpy().copy()
+        predicted_values_array = resp_buffer['predicted_values'][:batch_size].numpy().copy()
+        visit_counts_array = resp_buffer['visit_counts'][:batch_size].numpy().copy()
+        visit_entropy_array = resp_buffer['visit_entropy'][:batch_size].numpy().copy()
         
-        # 统计信息
-        eps_steps_lst = np.zeros(env_nums)
-        visit_entropies_lst = np.zeros(env_nums)
+        # 构建policy_output格式
+        actions_with_env_id = {}
+        value_dict_with_env_id = {}
+        pred_value_dict_with_env_id = {}
+        distributions_dict_with_env_id = {}
+        visit_entropy_dict_with_env_id = {}
         
-        ready_env_id = set(range(env_nums))
+        for i, env_id in enumerate(current_ready_env_id):
+            actions_with_env_id[env_id] = int(actions_array[i])
+            value_dict_with_env_id[env_id] = float(searched_values_array[i])
+            pred_value_dict_with_env_id[env_id] = float(predicted_values_array[i])
+            distributions_dict_with_env_id[env_id] = visit_counts_array[i].tolist()
+            visit_entropy_dict_with_env_id[env_id] = float(visit_entropy_array[i])
         
-        # ============ 主循环 ============
-        while self._running and self._collected_episodes < self._target_episodes:
-            # 获取ready的obs
-            obs = self._env.ready_obs
-            
-            if len(obs) == 0:
-                time.sleep(0.001)
+        # ============ 执行环境step ============
+        actions = {env_id: actions_with_env_id[env_id] for env_id in current_ready_env_id}
+        timesteps = env.step(actions)
+        
+        # ============ 处理step结果 ============
+        for env_id, episode_timestep in timesteps.items():
+            if episode_timestep.info.get('abnormal', False):
+                env.reset({env_id: None})
                 continue
                 
-            current_ready_env_id = set(obs.keys()).intersection(ready_env_id)
-            if len(current_ready_env_id) == 0:
-                time.sleep(0.001)
-                continue
-            
-            # 准备推理数据
-            stack_obs = {env_id: game_segments[env_id].get_obs() for env_id in current_ready_env_id}
-            stack_obs_list = list(stack_obs.values())
-            
-            action_mask = [action_mask_dict[env_id] for env_id in current_ready_env_id]
-            to_play = [to_play_dict[env_id] for env_id in current_ready_env_id]
-            timestep = [timestep_dict[env_id] for env_id in current_ready_env_id]
-            
-            # 预处理观察数据
-            stack_obs_array = to_ndarray(stack_obs_list)
-            stack_obs_array = prepare_observation(stack_obs_array, self._policy_config.model.model_type)
-            stack_obs_tensor = torch.from_numpy(stack_obs_array).to(self._policy_config.device)
-            
-            # ============ 发送推理请求 ============
-            request = InferenceRequest(
-                actor_id=self._actor_id,
-                request_id=self._request_counter,
-                stack_obs=stack_obs_tensor,
-                action_mask=action_mask,
-                to_play=to_play,
-                temperature=self._temperature,
-                epsilon=self._epsilon,
-                ready_env_id=np.array(list(current_ready_env_id)),
-                timestep=timestep
+            obs_data, reward, done, info = (
+                episode_timestep.obs, 
+                episode_timestep.reward, 
+                episode_timestep.done, 
+                episode_timestep.info
             )
-            self._request_counter += 1
-            self._request_queue.put(request)
             
-            # ============ 等待推理响应 ============
-            response: InferenceResponse = self._response_queue.get()
-            
-            if response.request_id != request.request_id:
-                raise RuntimeError(f"Response request_id mismatch: expected {request.request_id}, "
-                                 f"got {response.request_id}")
-            
-            policy_output = response.policy_output
-            
-            # 提取策略输出
-            actions_with_env_id = {k: v['action'] for k, v in policy_output.items()}
-            value_dict_with_env_id = {k: v['searched_value'] for k, v in policy_output.items()}
-            pred_value_dict_with_env_id = {k: v['predicted_value'] for k, v in policy_output.items()}
-            
-            if not self._policy_config.collect_with_pure_policy:
-                distributions_dict_with_env_id = {k: v['visit_count_distributions'] for k, v in policy_output.items()}
-                visit_entropy_dict_with_env_id = {k: v['visit_count_distribution_entropy'] for k, v in policy_output.items()}
-                
-                if self._policy_config.gumbel_algo:
-                    improved_policy_dict_with_env_id = {k: v['improved_policy_probs'] for k, v in policy_output.items()}
-            
-            if self._policy_config.sampled_algo:
-                root_sampled_actions_dict_with_env_id = {k: v['root_sampled_actions'] for k, v in policy_output.items()}
-            
-            # ============ 执行环境step ============
-            actions = {env_id: actions_with_env_id[env_id] for env_id in current_ready_env_id}
-            timesteps = self._env.step(actions)
-            
-            # ============ 处理step结果 ============
-            for env_id, episode_timestep in timesteps.items():
-                if episode_timestep.info.get('abnormal', False):
-                    self._env.reset({env_id: None})
-                    self._policy_reset_fn([env_id])
-                    continue
-                    
-                obs_data, reward, done, info = (
-                    episode_timestep.obs, 
-                    episode_timestep.reward, 
-                    episode_timestep.done, 
-                    episode_timestep.info
+            # 存储搜索统计
+            if not policy_config.collect_with_pure_policy:
+                game_segments[env_id].store_search_stats(
+                    distributions_dict_with_env_id[env_id],
+                    value_dict_with_env_id[env_id]
                 )
-                
-                # 存储搜索统计
-                if not self._policy_config.collect_with_pure_policy:
-                    if self._policy_config.sampled_algo:
-                        game_segments[env_id].store_search_stats(
-                            distributions_dict_with_env_id[env_id], 
-                            value_dict_with_env_id[env_id],
-                            root_sampled_actions_dict_with_env_id[env_id]
-                        )
-                    elif self._policy_config.gumbel_algo:
-                        game_segments[env_id].store_search_stats(
-                            distributions_dict_with_env_id[env_id],
-                            value_dict_with_env_id[env_id],
-                            improved_policy=improved_policy_dict_with_env_id[env_id]
-                        )
-                    else:
-                        game_segments[env_id].store_search_stats(
-                            distributions_dict_with_env_id[env_id],
-                            value_dict_with_env_id[env_id]
-                        )
-                
-                # 追加transition
-                if self._policy_config.use_ture_chance_label_in_chance_encoder:
-                    game_segments[env_id].append(
-                        actions_with_env_id[env_id], 
-                        to_ndarray(obs_data['observation']), 
-                        reward,
-                        action_mask_dict[env_id],
-                        to_play_dict[env_id], 
-                        timestep_dict[env_id],
-                        chance_dict[env_id]
+            
+            # 追加transition
+            if policy_config.use_ture_chance_label_in_chance_encoder:
+                game_segments[env_id].append(
+                    actions_with_env_id[env_id], 
+                    to_ndarray(obs_data['observation']), 
+                    reward,
+                    action_mask_dict[env_id],
+                    to_play_dict[env_id], 
+                    timestep_dict[env_id],
+                    chance_dict[env_id]
+                )
+            else:
+                game_segments[env_id].append(
+                    actions_with_env_id[env_id],
+                    to_ndarray(obs_data['observation']),
+                    reward,
+                    action_mask_dict[env_id],
+                    to_play_dict[env_id],
+                    timestep_dict[env_id]
+                )
+            
+            # 更新字典
+            action_mask_dict[env_id] = to_ndarray(obs_data['action_mask'])
+            to_play_dict[env_id] = to_ndarray(obs_data['to_play'])
+            timestep_dict[env_id] = to_ndarray(obs_data.get('timestep', -1))
+            if policy_config.use_ture_chance_label_in_chance_encoder:
+                chance_dict[env_id] = to_ndarray(obs_data['chance'])
+            
+            if policy_config.ignore_done:
+                dones[env_id] = False
+            else:
+                dones[env_id] = done
+            
+            if not policy_config.collect_with_pure_policy:
+                visit_entropies_lst[env_id] += visit_entropy_dict_with_env_id[env_id]
+            
+            eps_steps_lst[env_id] += 1
+            total_steps += 1
+            
+            if policy_config.use_priority:
+                pred_values_lst[env_id].append(pred_value_dict_with_env_id[env_id])
+                search_values_lst[env_id].append(value_dict_with_env_id[env_id])
+            
+            # 更新观察窗口
+            observation_window_stack[env_id].append(to_ndarray(obs_data['observation']))
+            
+            # ============ 保存GameSegment ============
+            if game_segments[env_id].is_full():
+                if last_game_segments[env_id] is not None:
+                    _pad_and_save_segment(
+                        env_id, last_game_segments, last_game_priorities,
+                        game_segments, dones, segment_queue, policy_config, unroll_plus_td_steps
                     )
-                else:
-                    game_segments[env_id].append(
-                        actions_with_env_id[env_id],
-                        to_ndarray(obs_data['observation']),
-                        reward,
-                        action_mask_dict[env_id],
-                        to_play_dict[env_id],
-                        timestep_dict[env_id]
+                
+                priorities = _compute_priorities(env_id, pred_values_lst, search_values_lst, policy_config)
+                pred_values_lst[env_id] = []
+                search_values_lst[env_id] = []
+                
+                last_game_segments[env_id] = game_segments[env_id]
+                last_game_priorities[env_id] = priorities
+                
+                game_segments[env_id] = GameSegment(
+                    env.action_space,
+                    game_segment_length=policy_config.game_segment_length,
+                    config=policy_config
+                )
+                game_segments[env_id].reset(observation_window_stack[env_id])
+            
+            # ============ Episode结束处理 ============
+            if episode_timestep.done:
+                collected_episodes += 1
+                
+                # 保存最后的segment
+                if last_game_segments[env_id] is not None:
+                    _pad_and_save_segment(
+                        env_id, last_game_segments, last_game_priorities,
+                        game_segments, dones, segment_queue, policy_config, unroll_plus_td_steps
                     )
                 
-                # 更新字典
-                action_mask_dict[env_id] = to_ndarray(obs_data['action_mask'])
-                to_play_dict[env_id] = to_ndarray(obs_data['to_play'])
-                timestep_dict[env_id] = to_ndarray(obs_data.get('timestep', -1))
-                if self._policy_config.use_ture_chance_label_in_chance_encoder:
-                    chance_dict[env_id] = to_ndarray(obs_data['chance'])
+                priorities = _compute_priorities(env_id, pred_values_lst, search_values_lst, policy_config)
+                game_segments[env_id].game_segment_to_array()
                 
-                if self._policy_config.ignore_done:
-                    dones[env_id] = False
-                else:
-                    dones[env_id] = done
+                if len(game_segments[env_id].reward_segment) != 0:
+                    segment_queue.put(CollectedSegment(
+                        game_segment=game_segments[env_id],
+                        priorities=priorities,
+                        done=dones[env_id]
+                    ))
                 
-                if not self._policy_config.collect_with_pure_policy:
-                    visit_entropies_lst[env_id] += visit_entropy_dict_with_env_id[env_id]
+                # 重置该环境
+                pred_values_lst[env_id] = []
+                search_values_lst[env_id] = []
+                eps_steps_lst[env_id] = 0
+                visit_entropies_lst[env_id] = 0
                 
-                eps_steps_lst[env_id] += 1
-                self._total_steps += 1
-                
-                if self._policy_config.use_priority:
-                    pred_values_lst[env_id].append(pred_value_dict_with_env_id[env_id])
-                    search_values_lst[env_id].append(value_dict_with_env_id[env_id])
-                
-                # 更新观察窗口
-                observation_window_stack[env_id].append(to_ndarray(obs_data['observation']))
-                
-                # ============ 保存GameSegment ============
-                if game_segments[env_id].is_full():
-                    if last_game_segments[env_id] is not None:
-                        self._pad_and_save_segment(
-                            env_id, last_game_segments, last_game_priorities,
-                            game_segments, dones
-                        )
+                # 如果还需要继续收集，重新初始化
+                if collected_episodes < n_episode:
+                    # 等待env reset完成
+                    reset_obs = None
+                    for _ in range(100):
+                        reset_obs = env.ready_obs
+                        if env_id in reset_obs:
+                            break
+                        time.sleep(0.01)
                     
-                    priorities = self._compute_priorities(env_id, pred_values_lst, search_values_lst)
-                    pred_values_lst[env_id] = []
-                    search_values_lst[env_id] = []
-                    
-                    last_game_segments[env_id] = game_segments[env_id]
-                    last_game_priorities[env_id] = priorities
-                    
-                    game_segments[env_id] = GameSegment(
-                        self._env.action_space,
-                        game_segment_length=self._policy_config.game_segment_length,
-                        config=self._policy_config
-                    )
-                    game_segments[env_id].reset(observation_window_stack[env_id])
-                
-                # ============ Episode结束处理 ============
-                if episode_timestep.done:
-                    self._collected_episodes += 1
-                    self._total_episodes += 1
-                    
-                    # 保存最后的segment
-                    if last_game_segments[env_id] is not None:
-                        self._pad_and_save_segment(
-                            env_id, last_game_segments, last_game_priorities,
-                            game_segments, dones
-                        )
-                    
-                    priorities = self._compute_priorities(env_id, pred_values_lst, search_values_lst)
-                    game_segments[env_id].game_segment_to_array()
-                    
-                    if len(game_segments[env_id].reward_segment) != 0:
-                        self._segment_queue.put(CollectedSegment(
-                            game_segment=game_segments[env_id],
-                            priorities=priorities,
-                            done=dones[env_id]
-                        ))
-                    
-                    # 重置该环境
-                    pred_values_lst[env_id] = []
-                    search_values_lst[env_id] = []
-                    eps_steps_lst[env_id] = 0
-                    visit_entropies_lst[env_id] = 0
-                    
-                    self._policy_reset_fn([env_id])
-                    
-                    # 如果还需要继续收集，重新初始化
-                    if self._collected_episodes < self._target_episodes:
-                        # 等待env reset完成
-                        reset_obs = None
-                        for _ in range(100):
-                            reset_obs = self._env.ready_obs
-                            if env_id in reset_obs:
-                                break
-                            time.sleep(0.01)
+                    if reset_obs and env_id in reset_obs:
+                        action_mask_dict[env_id] = to_ndarray(reset_obs[env_id]['action_mask'])
+                        to_play_dict[env_id] = to_ndarray(reset_obs[env_id]['to_play'])
+                        timestep_dict[env_id] = to_ndarray(reset_obs[env_id].get('timestep', -1))
+                        if policy_config.use_ture_chance_label_in_chance_encoder:
+                            chance_dict[env_id] = to_ndarray(reset_obs[env_id]['chance'])
                         
-                        if reset_obs and env_id in reset_obs:
-                            action_mask_dict[env_id] = to_ndarray(reset_obs[env_id]['action_mask'])
-                            to_play_dict[env_id] = to_ndarray(reset_obs[env_id]['to_play'])
-                            timestep_dict[env_id] = to_ndarray(reset_obs[env_id].get('timestep', -1))
-                            if self._policy_config.use_ture_chance_label_in_chance_encoder:
-                                chance_dict[env_id] = to_ndarray(reset_obs[env_id]['chance'])
-                            
-                            game_segments[env_id] = GameSegment(
-                                self._env.action_space,
-                                game_segment_length=self._policy_config.game_segment_length,
-                                config=self._policy_config
-                            )
-                            observation_window_stack[env_id] = deque(
-                                [reset_obs[env_id]['observation'] 
-                                 for _ in range(self._policy_config.model.frame_stack_num)],
-                                maxlen=self._policy_config.model.frame_stack_num
-                            )
-                            game_segments[env_id].reset(observation_window_stack[env_id])
-                            last_game_segments[env_id] = None
-                            last_game_priorities[env_id] = None
+                        game_segments[env_id] = GameSegment(
+                            env.action_space,
+                            game_segment_length=policy_config.game_segment_length,
+                            config=policy_config
+                        )
+                        observation_window_stack[env_id] = deque(
+                            [reset_obs[env_id]['observation'] 
+                             for _ in range(policy_config.model.frame_stack_num)],
+                            maxlen=policy_config.model.frame_stack_num
+                        )
+                        game_segments[env_id].reset(observation_window_stack[env_id])
+                        last_game_segments[env_id] = None
+                        last_game_priorities[env_id] = None
     
-    def _compute_priorities(self, env_id: int, pred_values_lst: List, search_values_lst: List) -> Optional[np.ndarray]:
-        """计算优先级"""
-        if self._policy_config.use_priority:
-            pred_values = torch.from_numpy(np.array(pred_values_lst[env_id])).to(
-                self._policy_config.device).float().view(-1)
-            search_values = torch.from_numpy(np.array(search_values_lst[env_id])).to(
-                self._policy_config.device).float().view(-1)
-            priorities = L1Loss(reduction='none')(pred_values, search_values).detach().cpu().numpy() + 1e-6
-        else:
-            priorities = None
-        return priorities
+    logging.info(f"[Actor-{actor_id}] 收集完成: {collected_episodes} episodes, {total_steps} steps")
+
+
+def _compute_priorities(env_id: int, pred_values_lst: List, search_values_lst: List, 
+                       policy_config: EasyDict) -> Optional[np.ndarray]:
+    """计算优先级"""
+    if policy_config.use_priority and len(pred_values_lst[env_id]) > 0:
+        pred_values = torch.tensor(pred_values_lst[env_id], dtype=torch.float32)
+        search_values = torch.tensor(search_values_lst[env_id], dtype=torch.float32)
+        priorities = L1Loss(reduction='none')(pred_values, search_values).numpy() + 1e-6
+    else:
+        priorities = None
+    return priorities
+
+
+def _pad_and_save_segment(
+    env_id: int,
+    last_game_segments: List,
+    last_game_priorities: List,
+    game_segments: List,
+    dones: np.ndarray,
+    segment_queue: mp.Queue,
+    policy_config: EasyDict,
+    unroll_plus_td_steps: int,
+):
+    """填充并保存segment"""
+    beg_index = policy_config.model.frame_stack_num
+    end_index = beg_index + policy_config.num_unroll_steps + policy_config.td_steps
     
-    def _pad_and_save_segment(
-        self, 
-        env_id: int,
-        last_game_segments: List,
-        last_game_priorities: List,
-        game_segments: List,
-        dones: np.ndarray
-    ):
-        """填充并保存segment"""
-        beg_index = self._policy_config.model.frame_stack_num
-        end_index = beg_index + self._policy_config.num_unroll_steps + self._policy_config.td_steps
-        
-        pad_obs_lst = game_segments[env_id].obs_segment[beg_index:end_index]
-        
-        beg_index = 0
-        end_index = beg_index + self._policy_config.num_unroll_steps + self._policy_config.td_steps
-        pad_action_lst = game_segments[env_id].action_segment[beg_index:end_index]
-        pad_child_visits_lst = game_segments[env_id].child_visit_segment[
-            :self._policy_config.num_unroll_steps + self._policy_config.td_steps
-        ]
-        
-        beg_index = 0
-        end_index = beg_index + self.unroll_plus_td_steps - 1
-        pad_reward_lst = game_segments[env_id].reward_segment[beg_index:end_index]
-        
-        beg_index = 0
-        end_index = beg_index + self.unroll_plus_td_steps
-        pad_root_values_lst = game_segments[env_id].root_value_segment[beg_index:end_index]
-        
-        if self._policy_config.gumbel_algo:
-            pad_improved_policy_prob = game_segments[env_id].improved_policy_probs[beg_index:end_index]
-            last_game_segments[env_id].pad_over(
-                pad_obs_lst, pad_reward_lst, pad_action_lst, 
-                pad_root_values_lst, pad_child_visits_lst,
-                next_segment_improved_policy=pad_improved_policy_prob
-            )
-        else:
-            last_game_segments[env_id].pad_over(
-                pad_obs_lst, pad_reward_lst, pad_action_lst,
-                pad_root_values_lst, pad_child_visits_lst
-            )
-        
-        last_game_segments[env_id].game_segment_to_array()
-        
-        self._segment_queue.put(CollectedSegment(
-            game_segment=last_game_segments[env_id],
-            priorities=last_game_priorities[env_id],
-            done=dones[env_id]
-        ))
-        
-        last_game_segments[env_id] = None
-        last_game_priorities[env_id] = None
+    pad_obs_lst = game_segments[env_id].obs_segment[beg_index:end_index]
+    
+    beg_index = 0
+    end_index = beg_index + policy_config.num_unroll_steps + policy_config.td_steps
+    pad_action_lst = game_segments[env_id].action_segment[beg_index:end_index]
+    pad_child_visits_lst = game_segments[env_id].child_visit_segment[
+        :policy_config.num_unroll_steps + policy_config.td_steps
+    ]
+    
+    beg_index = 0
+    end_index = beg_index + unroll_plus_td_steps - 1
+    pad_reward_lst = game_segments[env_id].reward_segment[beg_index:end_index]
+    
+    beg_index = 0
+    end_index = beg_index + unroll_plus_td_steps
+    pad_root_values_lst = game_segments[env_id].root_value_segment[beg_index:end_index]
+    
+    if policy_config.gumbel_algo:
+        pad_improved_policy_prob = game_segments[env_id].improved_policy_probs[beg_index:end_index]
+        last_game_segments[env_id].pad_over(
+            pad_obs_lst, pad_reward_lst, pad_action_lst, 
+            pad_root_values_lst, pad_child_visits_lst,
+            next_segment_improved_policy=pad_improved_policy_prob
+        )
+    else:
+        last_game_segments[env_id].pad_over(
+            pad_obs_lst, pad_reward_lst, pad_action_lst,
+            pad_root_values_lst, pad_child_visits_lst
+        )
+    
+    last_game_segments[env_id].game_segment_to_array()
+    
+    segment_queue.put(CollectedSegment(
+        game_segment=last_game_segments[env_id],
+        priorities=last_game_priorities[env_id],
+        done=dones[env_id]
+    ))
+    
+    last_game_segments[env_id] = None
+    last_game_priorities[env_id] = None
 
 
 # =============================================================================
@@ -691,20 +863,17 @@ class ActorWorker:
 @SERIAL_COLLECTOR_REGISTRY.register('multi_actor_muzero')
 class MultiActorMuZeroCollector(ISerialCollector):
     """
-    多Actor并行收集器 - 替代MuZeroCollector
+    多Actor并行收集器 - 多进程 + 共享内存实现
     
     核心优势:
-    - N个Actor并行运行，谁先ready谁先推理
-    - GPU不再空闲等待，连续推理
-    - 绕过单核CPU性能瓶颈
+    - 真正的多进程并行，绕过GIL限制
+    - 共享内存零拷贝，无序列化开销
+    - N个Actor并行运行，GPU持续推理
     
     使用方式:
     - 接口与MuZeroCollector完全一致
     - 通过policy_config.n_actors配置Actor数量
     - 通过policy_config.envs_per_actor配置每个Actor管理的环境数量
-    
-    支持的算法:
-    - MuZero, EfficientZero, Gumbel MuZero, Sampled MuZero等所有MuZero系列
     """
     
     config = dict()
@@ -718,24 +887,22 @@ class MultiActorMuZeroCollector(ISerialCollector):
         exp_name: Optional[str] = 'default_experiment',
         instance_name: Optional[str] = 'multi_actor_collector',
         policy_config: 'policy_config' = None,
-        env_fn: Callable = None,              # 环境创建函数
-        env_config: List[dict] = None,        # 环境配置列表
-        env_manager_cfg: dict = None,         # env_manager完整配置（来自cfg.env.manager）
+        env_fn: Callable = None,
+        env_config: List[dict] = None,
+        env_manager_cfg: dict = None,
     ) -> None:
         """
         Args:
             collect_print_freq: 打印频率
-            env: 原始env_manager（将被忽略，使用env_fn创建多个）
+            env: 原始env_manager（用于获取action_space等信息）
             policy: policy.collect_mode
             tb_logger: TensorBoard logger
             exp_name: 实验名称
             instance_name: 实例名称
-            policy_config: 策略配置，需要包含:
-                - n_actors: Actor数量
-                - envs_per_actor: 每个Actor管理的环境数量
+            policy_config: 策略配置
             env_fn: 环境创建函数
-            env_config: 环境配置
-            env_manager_cfg: env_manager的完整配置（直接从cfg.env.manager传入）
+            env_config: 环境配置列表
+            env_manager_cfg: env_manager配置
         """
         self._exp_name = exp_name
         self._instance_name = instance_name
@@ -772,24 +939,44 @@ class MultiActorMuZeroCollector(ISerialCollector):
         self._policy = policy
         
         # 多Actor配置
-        self._n_actors = getattr(policy_config, 'n_actors', 4)  # 默认4个Actor
-        self._envs_per_actor = getattr(policy_config, 'envs_per_actor', 8)  # 每个Actor 8个env
+        self._n_actors = getattr(policy_config, 'n_actors', 4)
+        self._envs_per_actor = getattr(policy_config, 'envs_per_actor', 8)
         
         # 保存环境创建信息
         self._env_fn = env_fn
         self._env_config = env_config
-        self._original_env = env  # 保留原始env用于获取action_space等信息
-        self._env_manager_cfg = env_manager_cfg  # 保存完整的env_manager配置
+        self._original_env = env
+        self._env_manager_cfg = env_manager_cfg if env_manager_cfg else {}
         
-        # 队列
-        self._request_queue: queue.Queue = queue.Queue()
-        self._response_queues: Dict[int, queue.Queue] = {}
-        self._segment_queue: queue.Queue = queue.Queue()
+        # 获取obs_shape和action_space_size
+        self._obs_shape = self._get_obs_shape()
+        self._action_space_size = self._get_action_space_size()
+        
+        # 初始化共享内存缓冲区
+        self._shared_obs_buffer = SharedObsBuffer(
+            n_actors=self._n_actors,
+            max_batch_size=self._envs_per_actor,
+            obs_shape=self._obs_shape
+        )
+        self._shared_response_buffer = SharedResponseBuffer(
+            n_actors=self._n_actors,
+            max_batch_size=self._envs_per_actor,
+            action_space_size=self._action_space_size
+        )
+        
+        # 进程间通信队列
+        self._request_queue: mp.Queue = mp.Queue()
+        self._response_queues: Dict[int, mp.Queue] = {i: mp.Queue() for i in range(self._n_actors)}
+        self._segment_queue: mp.Queue = mp.Queue()
+        
+        # 停止信号
+        self._stop_event: mp.Event = mp.Event()
+        
+        # 进程列表
+        self._actor_processes: List[mp.Process] = []
         
         # 组件
         self._inference_server: Optional[GPUInferenceServer] = None
-        self._actors: List[ActorWorker] = []
-        self._actor_envs: List[BaseEnvManager] = []
         
         # 统计
         self._total_envstep_count = 0
@@ -802,86 +989,24 @@ class MultiActorMuZeroCollector(ISerialCollector):
         self.game_segment_pool = deque(maxlen=int(1e6))
         self.unroll_plus_td_steps = policy_config.num_unroll_steps + policy_config.td_steps
         
-        self._logger.info(f"MultiActorMuZeroCollector initialized with {self._n_actors} actors, "
-                         f"{self._envs_per_actor} envs per actor")
+        self._logger.info(f"MultiActorMuZeroCollector 初始化完成: "
+                         f"n_actors={self._n_actors}, envs_per_actor={self._envs_per_actor}, "
+                         f"obs_shape={self._obs_shape}, action_space_size={self._action_space_size}")
     
-    def _create_actors(self):
-        """创建多个Actor和对应的env_manager"""
-        self._logger.info(f"Creating {self._n_actors} actors...")
+    def _get_obs_shape(self) -> tuple:
+        """获取观察shape"""
+        # 从policy_config获取
+        model_cfg = self.policy_config.model
+        obs_shape = model_cfg.observation_shape
         
-        # 清理旧的actors
-        for actor in self._actors:
-            actor.stop()
-        for env in self._actor_envs:
-            env.close()
-        self._actors.clear()
-        self._actor_envs.clear()
-        self._response_queues.clear()
-        
-        # 创建新的actors
-        for actor_id in range(self._n_actors):
-            # 为每个Actor创建独立的env_manager
-            if self._env_fn is not None and self._env_config is not None:
-                # 从env_config中取出该Actor对应的环境配置
-                start_idx = actor_id * self._envs_per_actor
-                end_idx = start_idx + self._envs_per_actor
-                actor_env_configs = list(self._env_config[start_idx:end_idx])
-                
-                # 如果配置不够，循环使用
-                while len(actor_env_configs) < self._envs_per_actor:
-                    remaining = self._envs_per_actor - len(actor_env_configs)
-                    actor_env_configs.extend(list(self._env_config[:remaining]))
-                
-                # 优先使用传入的env_manager配置（最优雅的方式）
-                if self._env_manager_cfg is not None:
-                    # 直接使用用户配置，最可靠
-                    env_manager_cfg = copy.deepcopy(self._env_manager_cfg)
-                    if not isinstance(env_manager_cfg, EasyDict):
-                        env_manager_cfg = EasyDict(env_manager_cfg)
-                else:
-                    # 回退：从原始env复制配置
-                    if hasattr(self._original_env, '_cfg') and self._original_env._cfg is not None:
-                        env_manager_cfg = copy.deepcopy(self._original_env._cfg)
-                    else:
-                        env_manager_cfg = EasyDict()
-                
-                # 确保type字段存在（创建时会被pop掉）
-                if 'type' not in env_manager_cfg:
-                    env_manager_cfg['type'] = 'subprocess'
-                
-                actor_env = create_env_manager(
-                    env_manager_cfg,
-                    [partial(self._env_fn, cfg=c) for c in actor_env_configs]
-                )
-            else:
-                # 复用原始env的设置
-                actor_env = self._original_env
-                if actor_id > 0:
-                    self._logger.warning(f"Actor {actor_id}: Reusing original env_manager, "
-                                        f"consider providing env_fn and env_config for true multi-actor")
-            
-            actor_env.seed(self.policy_config.seed + actor_id * 1000 if hasattr(self.policy_config, 'seed') else actor_id * 1000)
-            actor_env.launch()
-            self._actor_envs.append(actor_env)
-            
-            # 创建响应队列
-            response_queue = queue.Queue()
-            self._response_queues[actor_id] = response_queue
-            
-            # 创建Actor Worker
-            actor = ActorWorker(
-                actor_id=actor_id,
-                env=actor_env,
-                request_queue=self._request_queue,
-                response_queue=response_queue,
-                segment_queue=self._segment_queue,
-                policy_config=self.policy_config,
-                policy_reset_fn=self._policy.reset,
-                logger=self._logger
-            )
-            self._actors.append(actor)
-        
-        self._logger.info(f"Created {len(self._actors)} actors successfully")
+        # 对于需要frame_stack的情况，obs_shape已经包含了通道数
+        # 例如 (4, 96, 96) for Atari with frame_stack=4
+        # 或者 (56, 10, 9) for Chinese Chess
+        return tuple(obs_shape)
+    
+    def _get_action_space_size(self) -> int:
+        """获取动作空间大小"""
+        return self.policy_config.model.action_space_size
     
     def reset(self, _policy: Optional[namedtuple] = None, _env: Optional[BaseEnvManager] = None) -> None:
         """重置收集器"""
@@ -920,24 +1045,31 @@ class MultiActorMuZeroCollector(ISerialCollector):
             return
         self._end_flag = True
         
+        # 发送停止信号
+        self._stop_event.set()
+        
         # 停止推理服务器
         if self._inference_server:
             self._inference_server.stop()
         
-        # 停止所有Actor
-        for actor in self._actors:
-            actor.stop()
+        # 停止所有Actor进程
+        for process in self._actor_processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5.0)
         
-        # 关闭所有环境
-        for env in self._actor_envs:
+        # 关闭原始环境
+        if self._original_env:
             try:
-                env.close()
+                self._original_env.close()
             except:
                 pass
         
         if self._tb_logger:
             self._tb_logger.flush()
             self._tb_logger.close()
+        
+        self._logger.info("MultiActorMuZeroCollector 关闭完成")
     
     def __del__(self):
         self.close()
@@ -959,7 +1091,7 @@ class MultiActorMuZeroCollector(ISerialCollector):
             collect_with_pure_policy: 是否使用纯策略收集
             
         Returns:
-            return_data: [game_segments, meta_data] 与MuZeroCollector相同格式
+            return_data: [game_segments, meta_data]
         """
         if n_episode is None:
             n_episode = self._policy.get_attribute('cfg').get('n_episode', self._n_actors * self._envs_per_actor)
@@ -970,73 +1102,128 @@ class MultiActorMuZeroCollector(ISerialCollector):
         temperature = policy_kwargs.get('temperature', 1.0)
         epsilon = policy_kwargs.get('epsilon', 0.0)
         
-        self._logger.info(f"Starting multi-actor collect: n_episode={n_episode}, "
-                         f"n_actors={self._n_actors}, temperature={temperature}, epsilon={epsilon}")
+        self._logger.info(f"开始多Actor数据采集: n_episode={n_episode}, "
+                         f"n_actors={self._n_actors}, temperature={temperature:.4f}, epsilon={epsilon:.4f}")
         
         start_time = time.time()
         
-        # 创建Actors（如果尚未创建）
-        if len(self._actors) == 0:
-            self._create_actors()
+        # 清空停止信号
+        self._stop_event.clear()
+        
+        # 清空队列
+        while not self._segment_queue.empty():
+            try:
+                self._segment_queue.get_nowait()
+            except:
+                break
         
         # 启动GPU推理服务器
-        if self._inference_server is None:
-            self._inference_server = GPUInferenceServer(
-                policy=self._policy,
-                request_queue=self._request_queue,
-                response_queues=self._response_queues,
-                policy_config=self.policy_config,
-                logger=self._logger
-            )
+        self._inference_server = GPUInferenceServer(
+            policy=self._policy,
+            shared_obs_buffer=self._shared_obs_buffer,
+            shared_response_buffer=self._shared_response_buffer,
+            request_queue=self._request_queue,
+            response_queues=self._response_queues,
+            policy_config=self.policy_config,
+            logger=self._logger
+        )
         self._inference_server.start()
         
         # 计算每个Actor需要收集的episode数量
         episodes_per_actor = n_episode // self._n_actors
         remainder = n_episode % self._n_actors
         
-        # 启动所有Actor
-        for i, actor in enumerate(self._actors):
-            actor_episodes = episodes_per_actor + (1 if i < remainder else 0)
-            actor.start(n_episode=actor_episodes, temperature=temperature, epsilon=epsilon)
+        # 启动Actor进程
+        self._actor_processes = []
+        for actor_id in range(self._n_actors):
+            actor_episodes = episodes_per_actor + (1 if actor_id < remainder else 0)
+            
+            # 获取该Actor的环境配置
+            start_idx = actor_id * self._envs_per_actor
+            end_idx = start_idx + self._envs_per_actor
+            actor_env_configs = list(self._env_config[start_idx:end_idx])
+            
+            # 如果配置不够，循环使用
+            while len(actor_env_configs) < self._envs_per_actor:
+                remaining = self._envs_per_actor - len(actor_env_configs)
+                actor_env_configs.extend(list(self._env_config[:remaining]))
+            
+            # 创建进程
+            process = mp.Process(
+                target=_actor_process_main,
+                args=(
+                    actor_id,
+                    self._env_fn,
+                    actor_env_configs,
+                    dict(self._env_manager_cfg),
+                    dict(self.policy_config),
+                    self._shared_obs_buffer,
+                    self._shared_response_buffer,
+                    self._request_queue,
+                    self._response_queues[actor_id],
+                    self._segment_queue,
+                    self._stop_event,
+                    actor_episodes,
+                    temperature,
+                    epsilon,
+                    self.policy_config.seed if hasattr(self.policy_config, 'seed') else 0,
+                ),
+                daemon=True,
+                name=f"Actor-{actor_id}"
+            )
+            process.start()
+            self._actor_processes.append(process)
+        
+        self._logger.info(f"已启动 {len(self._actor_processes)} 个Actor进程")
         
         # 等待所有Actor完成并收集数据
         collected_segments = []
-        total_collected = 0
         
-        while total_collected < n_episode:
-            # 检查Actor状态
-            all_done = all(actor.is_done() for actor in self._actors)
+        while True:
+            # 检查是否所有进程都已完成
+            all_done = all(not p.is_alive() for p in self._actor_processes)
             
             # 从segment队列收集数据
             while not self._segment_queue.empty():
                 try:
-                    segment: CollectedSegment = self._segment_queue.get_nowait()
-                    collected_segments.append(segment)
-                    total_collected += 1
-                except queue.Empty:
+                    item = self._segment_queue.get_nowait()
+                    
+                    # 检查是否是错误信号
+                    if isinstance(item, tuple) and len(item) == 3 and item[0] == 'ERROR':
+                        _, actor_id, error_msg = item
+                        self._logger.error(f"Actor-{actor_id} 发生错误: {error_msg}")
+                        continue
+                    
+                    if isinstance(item, CollectedSegment):
+                        collected_segments.append(item)
+                except:
                     break
             
             if all_done:
+                # 收集剩余数据
+                time.sleep(0.1)
+                while not self._segment_queue.empty():
+                    try:
+                        item = self._segment_queue.get_nowait()
+                        if isinstance(item, CollectedSegment):
+                            collected_segments.append(item)
+                    except:
+                        break
                 break
             
             time.sleep(0.01)
         
-        # 收集剩余数据
-        while not self._segment_queue.empty():
-            try:
-                segment: CollectedSegment = self._segment_queue.get_nowait()
-                collected_segments.append(segment)
-            except queue.Empty:
-                break
-        
-        # 停止所有Actor
-        for actor in self._actors:
-            actor.stop()
-        
         # 停止推理服务器
         self._inference_server.stop()
         
-        # 整理返回数据 - 与MuZeroCollector格式一致
+        # 清理进程
+        for process in self._actor_processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2.0)
+        self._actor_processes.clear()
+        
+        # 整理返回数据
         for segment in collected_segments:
             self.game_segment_pool.append((segment.game_segment, segment.priorities, segment.done))
         
@@ -1054,14 +1241,14 @@ class MultiActorMuZeroCollector(ISerialCollector):
         self._total_episode_count += len(collected_segments)
         self._total_duration += collected_duration
         
-        # 估算envstep（每个segment大约game_segment_length步）
+        # 统计envstep
         for segment in collected_segments:
             self._total_envstep_count += len(segment.game_segment.reward_segment)
         
-        self._logger.info(f"Multi-actor collect finished: collected {len(collected_segments)} episodes "
-                         f"in {collected_duration:.2f}s, total_envstep={self._total_envstep_count}")
+        self._logger.info(f"多Actor采集完成: {len(collected_segments)} segments, "
+                         f"{collected_duration:.2f}s, total_envstep={self._total_envstep_count}")
         
-        # 清空pool准备下次收集
+        # 清空pool
         self.game_segment_pool.clear()
         
         # 输出日志
@@ -1082,4 +1269,3 @@ class MultiActorMuZeroCollector(ISerialCollector):
             }
             for k, v in info.items():
                 self._tb_logger.add_scalar(f'{self._instance_name}_iter/{k}', v, train_iter)
-
