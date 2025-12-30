@@ -230,7 +230,16 @@ class GPUInferenceServer:
         self._response_queues = response_queues
         self._policy_config = policy_config
         self._logger = logger
-        self._device = policy_config.device
+        
+        # 从模型参数获取实际设备（支持多卡DDP）
+        # policy_config.device 可能是 'cuda' 而不是 'cuda:4'，导致设备不匹配
+        try:
+            self._device = next(policy._collect_model.parameters()).device
+        except (StopIteration, AttributeError):
+            self._device = policy_config.device
+        
+        if self._logger:
+            self._logger.info(f"GPUInferenceServer 使用设备: {self._device}")
         
         self._running = False
         self._thread = None
