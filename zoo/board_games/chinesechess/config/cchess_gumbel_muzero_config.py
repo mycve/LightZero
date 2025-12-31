@@ -6,9 +6,9 @@ Gumbel MuZero 特有:
 - 基于 Gumbel 采样的策略改进
 - 更好的探索-利用平衡
 
-观察空间：(76, 10, 9) = 19层 × 4历史帧
+观察空间：(68, 10, 9) = 17层 × 4历史帧
 - 14层棋子（己方7层 + 对方7层）
-- 5层特征（重复计数、步数、限着计数、长将、子力不足）
+- 3层特征（重复计数、步数、限着计数）
 
 启动方式：
     单卡: python zoo/board_games/chinesechess/config/cchess_gumbel_muzero_config.py
@@ -48,9 +48,9 @@ cchess_gumbel_muzero_config = dict(
     policy=dict(
         model=dict(
             model_type='conv',
-            observation_shape=(76, 10, 9),  # 19层 × 4帧 = 76
+            observation_shape=(68, 10, 9),  # 17层 × 4帧 = 68
             action_space_size=ACTION_SPACE_SIZE,
-            image_channel=76,  # 与 observation_shape[0] 一致
+            image_channel=68,  # 与 observation_shape[0] 一致
             num_res_blocks=9,
             num_channels=128,
             reward_support_range=(-2., 3., 1.),

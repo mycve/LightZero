@@ -68,15 +68,15 @@ class ChineseChessEnv(BaseEnv):
     
     主要特性：
     - 动作空间：2238（压缩后的合法移动）
-    - 观察空间：(76, 10, 9) = 19层(14棋子+5特征) * 4历史帧，己方优先编码
+    - 观察空间：(68, 10, 9) = 17层(14棋子+3特征) * 4历史帧，己方优先编码
     - 固定视角：始终从当前行动方视角观察，己方棋子在前7层
     
-    新增特征通道（每帧5层）：
-    - 重复计数：当前局面重复次数 / 4.0
-    - 步数计数：当前步数 / 最大步数
-    - 限着计数：halfmove_clock / 120.0（60回合无吃子判和）
-    - 长将标记：是否处于长将状态
-    - 子力不足：是否子力不足
+    特征通道（每帧3层）：
+    - 重复计数：当前局面重复次数 / 4.0（提醒模型避免重复）
+    - 步数计数：当前步数 / 最大步数（提醒模型注意步数限制）
+    - 限着计数：halfmove_clock / 120.0（提醒模型注意吃子，60回合无吃子判和）
+    
+    注：长将、子力不足由环境直接判断对局结束，不作为观察特征
     """
     
     config = dict(
@@ -162,6 +162,22 @@ class ChineseChessEnv(BaseEnv):
         
         # 预计算：BitBoard位索引到(row, col)的映射
         self._square_to_coord = np.array([(s // 9, s % 9) for s in range(90)], dtype=np.int32)
+        
+        # 初始化动作空间和观察空间（在 reset 之前需要可访问）
+        self._action_space = spaces.Discrete(ACTION_SPACE_SIZE)
+        self._reward_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
+        # 观察空间：(17 * stack, 10, 9) = (68, 10, 9)
+        # 每帧17层 = 14层棋子 + 3层特征（重复计数、步数、限着）
+        obs_channels = 17 * self.stack_obs_num  # 68
+        self._observation_space = spaces.Dict(
+            {
+                "observation": spaces.Box(low=0, high=1, shape=(obs_channels, 10, 9), dtype=np.float32),
+                "action_mask": spaces.Box(low=0, high=1, shape=(ACTION_SPACE_SIZE,), dtype=np.int8),
+                "board": spaces.Box(low=0, high=7, shape=(10, 9), dtype=np.int8),
+                "current_player_index": spaces.Box(low=0, high=1, shape=(1,), dtype=np.int32),
+                "to_play": spaces.Box(low=-1, high=2, shape=(1,), dtype=np.int32),
+            }
+        )
 
     def _get_pieces_planes(self, color: bool) -> np.ndarray:
         """
@@ -186,31 +202,33 @@ class ChineseChessEnv(BaseEnv):
         """
         计算当前局面在历史中出现的次数
         
-        通过遍历棋盘的位置历史（zobrist hash）来统计重复次数
+        通过遍历棋盘的位置历史来统计重复次数
         
         Returns:
             当前局面的重复次数（至少为1，因为当前局面也算一次）
         """
-        # cchess.Board 内部使用 _position_counts 字典跟踪局面出现次数
-        # 通过 zobrist_hash() 获取当前局面的哈希值
-        current_hash = self.board._board_zobrist_hash()
-        return self.board._position_counts.get(current_hash, 1)
+        # 使用 cchess.Board 的 is_repetition 方法来检测重复
+        # 从高到低检查，找到最大的重复次数
+        for count in [4, 3, 2]:
+            if self.board.is_repetition(count):
+                return count
+        return 1  # 当前局面至少出现1次
     
     def _get_feature_planes(self) -> np.ndarray:
         """
-        获取 5 个新特征通道
+        获取 3 个特征通道
         
         Returns:
-            shape (5, 10, 9) 的数组，每层是一个标量值填充的平面
-            - 通道0: 重复计数 / 4.0（归一化到0~1）
-            - 通道1: 步数计数 / max_episode_steps（归一化到0~1）
-            - 通道2: 限着计数 / 120.0（halfmove_clock，60回合=120半回合判和）
-            - 通道3: 长将标记（0或1）
-            - 通道4: 子力不足标记（0或1）
-        """
-        planes = np.zeros((5, 10, 9), dtype=np.float32)
+            shape (3, 10, 9) 的数组，每层是一个标量值填充的平面
+            - 通道0: 重复计数 / 4.0（归一化到0~1，提醒模型避免重复）
+            - 通道1: 步数计数 / max_episode_steps（归一化到0~1，提醒模型注意步数限制）
+            - 通道2: 限着计数 / 120.0（halfmove_clock，提醒模型注意吃子）
         
-        # 通道0: 重复计数（归一化，4次重复判和）
+        注：长将、子力不足由环境直接判断对局结束，不作为观察特征
+        """
+        planes = np.zeros((3, 10, 9), dtype=np.float32)
+        
+        # 通道0: 重复计数（归一化，4次重复判和/负）
         repetition_count = self._count_repetition()
         planes[0] = min(repetition_count / 4.0, 1.0)
         
@@ -220,37 +238,22 @@ class ChineseChessEnv(BaseEnv):
         # 通道2: 限着计数（halfmove_clock / 120，60回合=120半回合判和）
         planes[2] = min(self.board.halfmove_clock / 120.0, 1.0)
         
-        # 通道3: 长将标记
-        # 注意：is_perpetual_check() 开销较大，仅在需要时调用
-        try:
-            planes[3] = 1.0 if self.board.is_perpetual_check() else 0.0
-        except Exception:
-            planes[3] = 0.0
-        
-        # 通道4: 子力不足标记
-        try:
-            planes[4] = 1.0 if self.board.is_insufficient_material() else 0.0
-        except Exception:
-            planes[4] = 0.0
-        
         return planes
     
     def _get_canonical_planes(self) -> np.ndarray:
         """
-        获取己方优先编码的棋盘表示（固定视角）+ 新特征通道
+        获取己方优先编码的棋盘表示（固定视角）+ 特征通道
         
         始终将当前行动方的棋子放在前7层，对手棋子放在后7层，
-        然后是5个新特征通道。
+        然后是3个特征通道。
         
         Returns:
-            shape (19, 10, 9) 的数组
+            shape (17, 10, 9) 的数组
             - 0-6层: 己方7种棋子
             - 7-13层: 对方7种棋子
             - 14层: 重复计数
             - 15层: 步数计数
             - 16层: 限着计数
-            - 17层: 长将标记
-            - 18层: 子力不足标记
         """
         if self._current_player == 1:  # 红方行动
             own_planes = self._get_pieces_planes(cchess.RED)
@@ -457,9 +460,9 @@ class ChineseChessEnv(BaseEnv):
         self._action_space = spaces.Discrete(ACTION_SPACE_SIZE)
         self._reward_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
         
-        # 观察空间：(19 * stack, 10, 9) = (76, 10, 9)
-        # 每帧19层 = 14层棋子 + 5层特征（重复计数、步数、限着、长将、子力不足）
-        obs_channels = 19 * self.stack_obs_num  # 76
+        # 观察空间：(17 * stack, 10, 9) = (68, 10, 9)
+        # 每帧17层 = 14层棋子 + 3层特征（重复计数、步数、限着）
+        obs_channels = 17 * self.stack_obs_num  # 68
         self._observation_space = spaces.Dict(
             {
                 "observation": spaces.Box(low=0, high=1, shape=(obs_channels, 10, 9), dtype=np.float32),
@@ -476,7 +479,7 @@ class ChineseChessEnv(BaseEnv):
         """
         获取当前堆叠状态（己方优先编码 + 特征通道）
         """
-        # 堆叠历史帧，shape: (19 * stack, 10, 9) = (76, 10, 9)
+        # 堆叠历史帧，shape: (17 * stack, 10, 9) = (68, 10, 9)
         state = np.concatenate(list(self.obs_buffer), axis=0)
         
         if self.scale:
