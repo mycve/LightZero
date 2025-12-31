@@ -64,17 +64,45 @@ def action_to_move(action: int) -> cchess.Move:
 @ENV_REGISTRY.register('cchess')
 class ChineseChessEnv(BaseEnv):
     """
-    中国象棋环境（重构版）
+    中国象棋环境（重构版，统一红方视角）
     
     主要特性：
     - 动作空间：2238（压缩后的合法移动）
-    - 观察空间：(68, 10, 9) = 17层(14棋子+3特征) * 4历史帧，己方优先编码
-    - 固定视角：始终从当前行动方视角观察，己方棋子在前7层
+    - 观察空间：(68, 10, 9) = 17层(14棋子+3特征) * 4历史帧
+    - **统一红方视角**：无论红方还是黑方行动，模型看到的都是相同视角
     
-    特征通道（每帧3层）：
-    - 重复计数：当前局面重复次数 / 4.0（提醒模型避免重复）
-    - 步数计数：当前步数 / 最大步数（提醒模型注意步数限制）
-    - 限着计数：halfmove_clock / 120.0（提醒模型注意吃子，60回合无吃子判和）
+    ===================== 统一红方视角设计 =====================
+    
+    核心思想：模型只需要学习"己方在下，向上进攻"这一种策略。
+    
+    实现方式：
+    1. 观测空间：
+       - 红方行动：正常视角，红方棋子在下方 (row 0-4)
+       - 黑方行动：棋盘180°翻转，翻转后黑方棋子也在下方
+       - 己方棋子始终在前7层 (通道 0-6)，对方棋子在后7层 (通道 7-13)
+    
+    2. 动作空间：
+       - 所有动作都是"红方视角的动作"
+       - 黑方行动时，环境自动将动作翻转回真实动作执行
+       - 翻转公式：square → 89 - square (180° 旋转)
+    
+    3. 合法动作：
+       - 红方行动：直接返回合法动作
+       - 黑方行动：将合法动作翻转到红方视角后返回
+    
+    优点：
+    - 策略共享：模型只学习一种策略，大大降低学习难度
+    - 样本效率：红方/黑方的训练数据可以互相利用
+    - 符合 AlphaZero 论文的标准做法
+    
+    ==========================================================
+    
+    特征通道（每帧17层）：
+    - 0-6层: 己方7种棋子（兵、车、马、炮、士、象、将）
+    - 7-13层: 对方7种棋子
+    - 14层: 重复计数 / 4.0（提醒模型避免重复）
+    - 15层: 步数计数 / 最大步数（提醒模型注意步数限制）
+    - 16层: 限着计数 / 120.0（提醒模型注意吃子，60回合无吃子判和）
     
     注：长将、子力不足由环境直接判断对局结束，不作为观察特征
     """
@@ -240,32 +268,63 @@ class ChineseChessEnv(BaseEnv):
         
         return planes
     
+    def _flip_square(self, square: int) -> int:
+        """
+        翻转格子坐标（180°旋转）
+        
+        棋盘是 10行×9列，共90格 (0-89)
+        square = row * 9 + col
+        翻转后: (9-row) * 9 + (8-col) = 89 - square
+        """
+        return 89 - square
+    
+    def _flip_action(self, action: int) -> int:
+        """
+        翻转动作（用于黑方视角转换）
+        
+        将"红方视角的动作"转换为"真实动作"，或反过来。
+        """
+        from_sq, to_sq = _action_to_move(action)
+        flipped_from = self._flip_square(from_sq)
+        flipped_to = self._flip_square(to_sq)
+        return _move_to_action(flipped_from, flipped_to)
+    
     def _get_canonical_planes(self) -> np.ndarray:
         """
-        获取己方优先编码的棋盘表示（固定视角）+ 特征通道
+        获取统一红方视角的棋盘表示 + 特征通道
         
-        始终将当前行动方的棋子放在前7层，对手棋子放在后7层，
-        然后是3个特征通道。
+        核心思想：无论红方还是黑方行动，模型看到的都是"己方在下（row 0-4），
+        向上进攻"的视角。这样模型只需要学习一种策略。
+        
+        实现方式：
+        - 红方行动时：正常视角，红方在下
+        - 黑方行动时：棋盘180°翻转，翻转后黑方在下
         
         Returns:
             shape (17, 10, 9) 的数组
-            - 0-6层: 己方7种棋子
-            - 7-13层: 对方7种棋子
+            - 0-6层: 己方7种棋子（始终在下方 row 0-4 附近）
+            - 7-13层: 对方7种棋子（始终在上方 row 5-9 附近）
             - 14层: 重复计数
             - 15层: 步数计数
             - 16层: 限着计数
         """
         if self._current_player == 1:  # 红方行动
+            # 红方视角：正常，红方在下
             own_planes = self._get_pieces_planes(cchess.RED)
             opp_planes = self._get_pieces_planes(cchess.BLACK)
+            feature_planes = self._get_feature_planes()
+            planes = np.concatenate([own_planes, opp_planes, feature_planes], axis=0)
         else:  # 黑方行动
+            # 黑方视角：先获取正常棋盘，然后180°翻转
             own_planes = self._get_pieces_planes(cchess.BLACK)
             opp_planes = self._get_pieces_planes(cchess.RED)
+            feature_planes = self._get_feature_planes()
+            planes = np.concatenate([own_planes, opp_planes, feature_planes], axis=0)
+            # 180° 翻转棋盘（沿 row 和 col 都翻转）
+            # 翻转后黑方棋子就在下方了
+            planes = np.flip(planes, axis=(1, 2)).copy()
         
-        # 获取新特征通道
-        feature_planes = self._get_feature_planes()
-        
-        return np.concatenate([own_planes, opp_planes, feature_planes], axis=0)
+        return planes
 
     def _update_obs_buffer(self):
         """更新观测缓存"""
@@ -275,8 +334,11 @@ class ChineseChessEnv(BaseEnv):
     def _player_step(self, action: int, flag: str) -> BaseEnvTimestep:
         """
         执行一步棋
+        
+        注意：输入的 action 是"红方视角的动作"（统一视角）。
+        黑方行动时，需要翻转回"真实动作"才能执行。
         """
-        legal_actions = self.legal_actions
+        legal_actions = self.legal_actions  # 这是红方视角的合法动作
         
         if action not in legal_actions:
             logging.warning(
@@ -288,7 +350,12 @@ class ChineseChessEnv(BaseEnv):
         # 保存执行动作的玩家（用于奖励计算）
         acting_player = self._current_player
         
-        move = action_to_move(action)
+        # 黑方行动时，将"红方视角动作"翻转回"真实动作"
+        real_action = action
+        if self._current_player == 2:
+            real_action = self._flip_action(action)
+        
+        move = action_to_move(real_action)
         
         # 记录移动历史（用于 HTML 回放）
         self.move_history.append({
@@ -530,12 +597,23 @@ class ChineseChessEnv(BaseEnv):
 
     @property
     def legal_actions(self) -> List[int]:
-        """返回所有合法动作的索引列表（使用压缩映射）"""
+        """
+        返回所有合法动作的索引列表（统一红方视角）
+        
+        - 红方行动时：直接返回合法动作
+        - 黑方行动时：将合法动作翻转到红方视角
+        
+        这样模型看到的动作空间始终是"从红方视角看的动作"。
+        """
         legal_actions_list = []
         for move in self.board.legal_moves:
             key = (move.from_square, move.to_square)
             if key in MOVE_TO_ACTION:
-                legal_actions_list.append(MOVE_TO_ACTION[key])
+                action = MOVE_TO_ACTION[key]
+                # 黑方行动时，翻转动作到红方视角
+                if self._current_player == 2:
+                    action = self._flip_action(action)
+                legal_actions_list.append(action)
             else:
                 # 这不应该发生，但为了安全起见记录警告
                 logging.warning(f"移动 {key} 不在映射表中，跳过")
@@ -576,13 +654,21 @@ class ChineseChessEnv(BaseEnv):
         return np.random.choice(self.legal_actions)
     
     def bot_action(self) -> int:
-        """使用UCI引擎或随机策略选择动作"""
+        """
+        使用UCI引擎或随机策略选择动作
+        
+        返回的是"红方视角的动作"（统一视角）。
+        """
         if self.engine is not None:
             try:
                 from .cchess import engine as engine_module
                 limit = engine_module.Limit(depth=self.engine_depth)
                 result = self.engine.play(self.board, limit)
-                return move_to_action(result.move)
+                action = move_to_action(result.move)
+                # 引擎返回的是真实动作，黑方时需要翻转到红方视角
+                if self._current_player == 2:
+                    action = self._flip_action(action)
+                return action
             except Exception as e:
                 logging.warning(f"引擎调用失败: {e}，使用随机策略")
                 return self.random_action()
@@ -590,13 +676,20 @@ class ChineseChessEnv(BaseEnv):
             return self.random_action()
 
     def human_to_action(self) -> int:
-        """从人类输入获取动作"""
+        """
+        从人类输入获取动作
+        
+        返回的是"红方视角的动作"（统一视角）。
+        """
         print(self.board.unicode(axes=True, axes_type=0))
         while True:
             try:
                 uci = input(f"请输入走法（UCI格式，如 h2e2）: ")
                 move = cchess.Move.from_uci(uci)
                 action = move_to_action(move)
+                # 人类输入的是真实动作，黑方时需要翻转到红方视角
+                if self._current_player == 2:
+                    action = self._flip_action(action)
                 if action in self.legal_actions:
                     return action
                 else:
@@ -645,12 +738,23 @@ class ChineseChessEnv(BaseEnv):
         return copy.deepcopy(self)
 
     def simulate_action(self, action: int) -> Any:
-        """模拟执行动作并返回新的模拟环境（用于 MCTS）"""
+        """
+        模拟执行动作并返回新的模拟环境（用于 MCTS）
+        
+        注意：输入的 action 是"红方视角的动作"（统一视角）。
+        黑方行动时，需要翻转回"真实动作"才能执行。
+        """
         if action not in self.legal_actions:
             raise ValueError(f"动作 {action} 不合法")
         
         new_env = self.copy()
-        move = action_to_move(action)
+        
+        # 黑方行动时，将"红方视角动作"翻转回"真实动作"
+        real_action = action
+        if self._current_player == 2:
+            real_action = self._flip_action(action)
+        
+        move = action_to_move(real_action)
         new_env.board.push(move)
         new_env.current_step += 1
         new_env._current_player = 1 if new_env.board.turn else 2
