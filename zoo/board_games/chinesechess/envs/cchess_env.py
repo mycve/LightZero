@@ -505,19 +505,30 @@ class ChineseChessEnv(BaseEnv):
             return timestep_player2
 
     def reset(self, start_player_index: int = 0, init_state: Optional[str] = None) -> dict:
-        """重置环境"""
+        """
+        重置环境
+        
+        关键：start_player_index 和 _current_player 必须保持一致！
+        对于中国象棋，棋盘状态（FEN）本身包含了谁该走的信息（board.turn），
+        因此 start_player_index 应该基于 board.turn 来设置，而不是使用传入的参数。
+        """
         if init_state is None:
             self.board = cchess.Board()
         else:
             self.board = cchess.Board(fen=init_state)
         
         self.players = [1, 2]
-        self.start_player_index = start_player_index
         self.current_step = 0
         self.frames = []
         self.move_history = []
         
+        # 关键修复：_current_player 基于棋盘状态设置
         self._current_player = 1 if self.board.turn else 2
+        
+        # 关键修复：start_player_index 必须与 _current_player 保持一致！
+        # 这是 MCTS 正确计算价值的关键！
+        # players = [1, 2]，所以 index 0 对应玩家 1（红方），index 1 对应玩家 2（黑方）
+        self.start_player_index = 0 if self._current_player == 1 else 1
 
         # 重置历史观测
         self.obs_buffer.clear()
@@ -743,21 +754,32 @@ class ChineseChessEnv(BaseEnv):
         
         注意：输入的 action 是"红方视角的动作"（统一视角）。
         黑方行动时，需要翻转回"真实动作"才能执行。
+        
+        关键：必须正确切换 start_player_index，否则 MCTS 价值回传会出错！
+        参考五子棋等环境的标准实现。
         """
         if action not in self.legal_actions:
             raise ValueError(f"动作 {action} 不合法")
-        
-        new_env = self.copy()
         
         # 黑方行动时，将"红方视角动作"翻转回"真实动作"
         real_action = action
         if self._current_player == 2:
             real_action = self._flip_action(action)
         
+        # 在当前环境上执行动作，获取新的棋盘状态
         move = action_to_move(real_action)
+        
+        # 复制当前环境
+        new_env = self.copy()
         new_env.board.push(move)
         new_env.current_step += 1
+        
+        # 关键修复：确保 start_player_index 与 _current_player 保持一致
+        # 这是 MCTS 正确计算价值的关键！
+        # 中国象棋的棋盘状态（board.turn）决定了谁该走棋
         new_env._current_player = 1 if new_env.board.turn else 2
+        new_env.start_player_index = 0 if new_env._current_player == 1 else 1
+        
         new_env._update_obs_buffer()
         
         return new_env
