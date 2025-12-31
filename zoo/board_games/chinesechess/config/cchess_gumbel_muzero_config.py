@@ -27,7 +27,7 @@ gpu_num = 8
 
 # 多Actor配置
 n_actors = 4                     # 每张卡的Actor进程数量
-envs_per_actor = 512              # 每个Actor管理的环境数量
+envs_per_actor = 64              # 每个Actor管理的环境数量
 
 collector_env_num = n_actors * envs_per_actor  # 64 per GPU
 n_episode = collector_env_num
@@ -122,7 +122,7 @@ create_config = cchess_gumbel_muzero_create_config
 
 if __name__ == "__main__":
     """
-    8卡DDP训练: torchrun --nproc_per_node=8 此文件
+    8卡DDP训练: torchrun --nproc_per_node=8 zoo/board_games/chinesechess/config/cchess_gumbel_muzero_config.py
     """
     from ding.utils import DDPContext
     from lzero.entry import train_muzero

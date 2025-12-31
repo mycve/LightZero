@@ -25,7 +25,7 @@ gpu_num = 8
 # 多Actor配置（核心性能参数）
 # 多卡时，每张卡有独立的Collector，所以每卡的Actor数可以适当减少
 n_actors = 4                     # 每张卡的Actor进程数量
-envs_per_actor = 512              # 每个Actor管理的环境数量
+envs_per_actor = 64              # 每个Actor管理的环境数量
 
 # 总环境数 = n_actors * envs_per_actor（每张卡）
 collector_env_num = n_actors * envs_per_actor  # 64 per GPU, 总共 64*8=512
