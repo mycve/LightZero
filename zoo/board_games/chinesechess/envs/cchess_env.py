@@ -68,8 +68,15 @@ class ChineseChessEnv(BaseEnv):
     
     主要特性：
     - 动作空间：2238（压缩后的合法移动）
-    - 观察空间：(56, 10, 9) = 14层棋子 * 4历史帧，己方优先编码
+    - 观察空间：(76, 10, 9) = 19层(14棋子+5特征) * 4历史帧，己方优先编码
     - 固定视角：始终从当前行动方视角观察，己方棋子在前7层
+    
+    新增特征通道（每帧5层）：
+    - 重复计数：当前局面重复次数 / 4.0
+    - 步数计数：当前步数 / 最大步数
+    - 限着计数：halfmove_clock / 120.0（60回合无吃子判和）
+    - 长将标记：是否处于长将状态
+    - 子力不足：是否子力不足
     """
     
     config = dict(
@@ -175,15 +182,75 @@ class ChineseChessEnv(BaseEnv):
                     planes[i, r, c] = 1
         return planes
 
-    def _get_canonical_planes(self) -> np.ndarray:
+    def _count_repetition(self) -> int:
         """
-        获取己方优先编码的棋盘表示（固定视角）
+        计算当前局面在历史中出现的次数
         
-        始终将当前行动方的棋子放在前7层，对手棋子放在后7层。
-        不再旋转棋盘，也不再添加颜色层。
+        通过遍历棋盘的位置历史（zobrist hash）来统计重复次数
         
         Returns:
-            shape (14, 10, 9) 的数组
+            当前局面的重复次数（至少为1，因为当前局面也算一次）
+        """
+        # cchess.Board 内部使用 _position_counts 字典跟踪局面出现次数
+        # 通过 zobrist_hash() 获取当前局面的哈希值
+        current_hash = self.board._board_zobrist_hash()
+        return self.board._position_counts.get(current_hash, 1)
+    
+    def _get_feature_planes(self) -> np.ndarray:
+        """
+        获取 5 个新特征通道
+        
+        Returns:
+            shape (5, 10, 9) 的数组，每层是一个标量值填充的平面
+            - 通道0: 重复计数 / 4.0（归一化到0~1）
+            - 通道1: 步数计数 / max_episode_steps（归一化到0~1）
+            - 通道2: 限着计数 / 120.0（halfmove_clock，60回合=120半回合判和）
+            - 通道3: 长将标记（0或1）
+            - 通道4: 子力不足标记（0或1）
+        """
+        planes = np.zeros((5, 10, 9), dtype=np.float32)
+        
+        # 通道0: 重复计数（归一化，4次重复判和）
+        repetition_count = self._count_repetition()
+        planes[0] = min(repetition_count / 4.0, 1.0)
+        
+        # 通道1: 步数计数（归一化）
+        planes[1] = min(self.current_step / self.max_episode_steps, 1.0)
+        
+        # 通道2: 限着计数（halfmove_clock / 120，60回合=120半回合判和）
+        planes[2] = min(self.board.halfmove_clock / 120.0, 1.0)
+        
+        # 通道3: 长将标记
+        # 注意：is_perpetual_check() 开销较大，仅在需要时调用
+        try:
+            planes[3] = 1.0 if self.board.is_perpetual_check() else 0.0
+        except Exception:
+            planes[3] = 0.0
+        
+        # 通道4: 子力不足标记
+        try:
+            planes[4] = 1.0 if self.board.is_insufficient_material() else 0.0
+        except Exception:
+            planes[4] = 0.0
+        
+        return planes
+    
+    def _get_canonical_planes(self) -> np.ndarray:
+        """
+        获取己方优先编码的棋盘表示（固定视角）+ 新特征通道
+        
+        始终将当前行动方的棋子放在前7层，对手棋子放在后7层，
+        然后是5个新特征通道。
+        
+        Returns:
+            shape (19, 10, 9) 的数组
+            - 0-6层: 己方7种棋子
+            - 7-13层: 对方7种棋子
+            - 14层: 重复计数
+            - 15层: 步数计数
+            - 16层: 限着计数
+            - 17层: 长将标记
+            - 18层: 子力不足标记
         """
         if self._current_player == 1:  # 红方行动
             own_planes = self._get_pieces_planes(cchess.RED)
@@ -192,7 +259,10 @@ class ChineseChessEnv(BaseEnv):
             own_planes = self._get_pieces_planes(cchess.BLACK)
             opp_planes = self._get_pieces_planes(cchess.RED)
         
-        return np.concatenate([own_planes, opp_planes], axis=0)
+        # 获取新特征通道
+        feature_planes = self._get_feature_planes()
+        
+        return np.concatenate([own_planes, opp_planes, feature_planes], axis=0)
 
     def _update_obs_buffer(self):
         """更新观测缓存"""
@@ -252,32 +322,49 @@ class ChineseChessEnv(BaseEnv):
             if outcome and outcome.winner is not None:
                 winner_info = "RED" if outcome.winner == cchess.RED else "BLACK"
             
-            if outcome and outcome.winner is not None:
-                # 有明确的胜者，奖励从执行动作的玩家视角计算
-                if outcome.winner == cchess.RED:
-                    reward_scalar = 1.0 if acting_player == 1 else -1.0
-                else:
-                    reward_scalar = -1.0 if acting_player == 1 else 1.0
-                logging.info(f"[ENV] Game Won! Winner: {winner_info}, ActingPlayer: {acting_player}, "
-                           f"Reward: {reward_scalar}, Reason: {termination_reason}, Steps: {self.current_step}")
-            else:
-                # 和棋或特殊情况处理
-                # draw_as_loss=True 时，所有和棋情况都判负（鼓励进攻）
-                if self.draw_as_loss:
+            # ============================================
+            # 奖励设计（根据不同结局类型）
+            # ============================================
+            # | 结局类型 | Termination | 奖励 |
+            # | 将死/困毙 | CHECKMATE/STALEMATE | 胜者+1，败者-1 |
+            # | 四次重复 | FOURFOLD_REPETITION | 双方-1（惩罚重复） |
+            # | 长将 | PERPETUAL_CHECK | 长将方-1（对手胜） |
+            # | 子力不足 | INSUFFICIENT_MATERIAL | 0（和棋） |
+            # | 60回合无吃子 | SIXTY_MOVES | 0（和棋） |
+            # | 最大步数 | MaxSteps | -1（双方负） |
+            # ============================================
+            
+            if outcome is not None:
+                if outcome.termination == cchess.Termination.FOURFOLD_REPETITION:
+                    # 四次重复：双方都判负（惩罚重复走法）
                     reward_scalar = -1.0
-                    logging.info(f"[ENV] Draw->Loss! Reason: {termination_reason}, "
-                               f"ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
+                    logging.info(f"[ENV] 四次重复! 双方负分. ActingPlayer: {acting_player}, Steps: {self.current_step}")
+                
+                elif outcome.termination in [cchess.Termination.INSUFFICIENT_MATERIAL, 
+                                              cchess.Termination.SIXTY_MOVES]:
+                    # 子力不足 / 60回合无吃子：和棋 0 分
+                    reward_scalar = 0.0
+                    logging.info(f"[ENV] 和棋! Reason: {termination_reason}, Steps: {self.current_step}")
+                
+                elif outcome.winner is not None:
+                    # 有明确的胜者（CHECKMATE、STALEMATE、PERPETUAL_CHECK 等）
+                    # 奖励从执行动作的玩家视角计算
+                    if outcome.winner == cchess.RED:
+                        reward_scalar = 1.0 if acting_player == 1 else -1.0
+                    else:  # BLACK wins
+                        reward_scalar = -1.0 if acting_player == 1 else 1.0
+                    logging.info(f"[ENV] 胜负分明! Winner: {winner_info}, ActingPlayer: {acting_player}, "
+                               f"Reward: {reward_scalar}, Reason: {termination_reason}, Steps: {self.current_step}")
+                
                 else:
-                    # 原始逻辑：只有特定情况判负
-                    if termination_reason == cchess.Termination.FOURFOLD_REPETITION:
-                        reward_scalar = -1.0
-                        logging.info(f"[ENV] Repetition! ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
-                    elif self.current_step >= self.max_episode_steps:
-                        reward_scalar = -1.0
-                        logging.info(f"[ENV] MaxSteps! ActingPlayer: {acting_player} LOSE, Steps: {self.current_step}")
-                    else:
-                        reward_scalar = 0.0
-                        logging.info(f"[ENV] Draw. Reason: {termination_reason}, Steps: {self.current_step}")
+                    # 其他无胜者情况（理论上不应该走到这里）
+                    reward_scalar = 0.0
+                    logging.info(f"[ENV] 未知和棋. Reason: {termination_reason}, Steps: {self.current_step}")
+            
+            else:
+                # outcome 为 None（达到最大步数）
+                reward_scalar = -1.0
+                logging.info(f"[ENV] 最大步数! ActingPlayer: {acting_player} 双方负分, Steps: {self.current_step}")
         else:
             reward_scalar = 0.0
         
@@ -370,8 +457,9 @@ class ChineseChessEnv(BaseEnv):
         self._action_space = spaces.Discrete(ACTION_SPACE_SIZE)
         self._reward_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
         
-        # 观察空间：(14 * stack, 10, 9) - 去除颜色层
-        obs_channels = 14 * self.stack_obs_num  # 56
+        # 观察空间：(19 * stack, 10, 9) = (76, 10, 9)
+        # 每帧19层 = 14层棋子 + 5层特征（重复计数、步数、限着、长将、子力不足）
+        obs_channels = 19 * self.stack_obs_num  # 76
         self._observation_space = spaces.Dict(
             {
                 "observation": spaces.Box(low=0, high=1, shape=(obs_channels, 10, 9), dtype=np.float32),
@@ -386,9 +474,9 @@ class ChineseChessEnv(BaseEnv):
 
     def current_state(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        获取当前堆叠状态（己方优先编码，无颜色层）
+        获取当前堆叠状态（己方优先编码 + 特征通道）
         """
-        # 堆叠历史帧，shape: (14 * stack, 10, 9) = (56, 10, 9)
+        # 堆叠历史帧，shape: (19 * stack, 10, 9) = (76, 10, 9)
         state = np.concatenate(list(self.obs_buffer), axis=0)
         
         if self.scale:
