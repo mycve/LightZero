@@ -21,8 +21,8 @@ from zoo.board_games.chinesechess.envs.action_mapping import ACTION_SPACE_SIZE
 # ==============================================================
 # 常用配置参数（用户可修改区域）
 # ==============================================================
-collector_env_num = 8
-n_episode = 8
+collector_env_num = 64
+n_episode = 128
 evaluator_env_num = 3
 num_simulations = 50
 update_per_collect = 50
