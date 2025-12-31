@@ -42,7 +42,7 @@ cchess_efficientzero_config = dict(
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
         n_evaluator_episode=evaluator_env_num,
-        manager=dict(shared_memory=False),
+        manager=dict(shared_memory=True),
         max_episode_steps=max_episode_steps,
     ),
     policy=dict(
