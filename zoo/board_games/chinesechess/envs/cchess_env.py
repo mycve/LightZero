@@ -318,6 +318,9 @@ class ChineseChessEnv(BaseEnv):
             done = True
             outcome = None  # 达到最大步数视为平局
         
+        # 初始化 info 字典
+        info = {}
+        
         if done:
             # [DEBUG] 详细打印游戏结束原因
             termination_reason = outcome.termination if outcome else "MaxSteps/Unknown"
@@ -326,22 +329,22 @@ class ChineseChessEnv(BaseEnv):
                 winner_info = "RED" if outcome.winner == cchess.RED else "BLACK"
             
             # ============================================
-            # 奖励设计（根据不同结局类型）
+            # 奖励设计（零和博弈）
             # ============================================
             # | 结局类型 | Termination | 奖励 |
             # | 将死/困毙 | CHECKMATE/STALEMATE | 胜者+1，败者-1 |
-            # | 四次重复 | FOURFOLD_REPETITION | 双方-1（惩罚重复） |
             # | 长将 | PERPETUAL_CHECK | 长将方-1（对手胜） |
+            # | 四次重复 | FOURFOLD_REPETITION | 0（和棋） |
             # | 子力不足 | INSUFFICIENT_MATERIAL | 0（和棋） |
             # | 60回合无吃子 | SIXTY_MOVES | 0（和棋） |
-            # | 最大步数 | MaxSteps | -1（双方负） |
+            # | 最大步数 | MaxSteps | 0（和棋） |
             # ============================================
             
             if outcome is not None:
                 if outcome.termination == cchess.Termination.FOURFOLD_REPETITION:
-                    # 四次重复：双方都判负（惩罚重复走法）
-                    reward_scalar = -1.0
-                    logging.info(f"[ENV] 四次重复! 双方负分. ActingPlayer: {acting_player}, Steps: {self.current_step}")
+                    # 四次重复：和棋 0 分（零和博弈）
+                    reward_scalar = 0.0
+                    logging.info(f"[ENV] 四次重复和棋! ActingPlayer: {acting_player}, Steps: {self.current_step}")
                 
                 elif outcome.termination in [cchess.Termination.INSUFFICIENT_MATERIAL, 
                                               cchess.Termination.SIXTY_MOVES]:
@@ -365,14 +368,13 @@ class ChineseChessEnv(BaseEnv):
                     logging.info(f"[ENV] 未知和棋. Reason: {termination_reason}, Steps: {self.current_step}")
             
             else:
-                # outcome 为 None（达到最大步数）
-                reward_scalar = -1.0
-                logging.info(f"[ENV] 最大步数! ActingPlayer: {acting_player} 双方负分, Steps: {self.current_step}")
+                # outcome 为 None（达到最大步数）：和棋 0 分（零和博弈）
+                reward_scalar = 0.0
+                logging.info(f"[ENV] 最大步数和棋! ActingPlayer: {acting_player}, Steps: {self.current_step}")
         else:
             reward_scalar = 0.0
         
         reward = np.array([reward_scalar], dtype=np.float32)
-        info = {}
         obs = self.observe()
         
         return BaseEnvTimestep(obs, reward, done, info)
