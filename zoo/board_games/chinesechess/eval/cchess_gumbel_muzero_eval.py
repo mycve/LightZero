@@ -11,7 +11,7 @@
 """
 
 import numpy as np
-from zoo.board_games.chinesechess.config.cchess_gumbel_muzero_sp_mode_config import main_config, create_config
+from zoo.board_games.chinesechess.config.cchess_gumbel_muzero_config import main_config, create_config
 from lzero.entry import eval_muzero
 
 
