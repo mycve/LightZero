@@ -451,31 +451,40 @@ class MuZeroCollector(ISerialCollector):
                 # print(f'ready_env_id:{ready_env_id}')
                 policy_output = self._policy.forward(stack_obs, action_mask, temperature, to_play, epsilon, ready_env_id=ready_env_id, timestep=timestep)
                 
-                pred_next_text_with_env_id = {k: v['predicted_next_text'] if 'predicted_next_text' in v else -1 for k, v in policy_output.items()}
-                    
-                # Extract relevant policy outputs
-                actions_with_env_id = {k: v['action'] for k, v in policy_output.items()}
-                value_dict_with_env_id = {k: v['searched_value'] for k, v in policy_output.items()}
-                pred_value_dict_with_env_id = {k: v['predicted_value'] for k, v in policy_output.items()}
-                timestep_dict_with_env_id = {
-                        k: v['timestep'] if 'timestep' in v else -1 for k, v in policy_output.items()
-                }
-
+                # ============================================
+                # 优化：合并多次字典遍历为一次遍历
+                # ============================================
+                actions_with_env_id = {}
+                value_dict_with_env_id = {}
+                pred_value_dict_with_env_id = {}
+                timestep_dict_with_env_id = {}
+                pred_next_text_with_env_id = {}
+                
                 if self.policy_config.sampled_algo:
-                    root_sampled_actions_dict_with_env_id = {
-                        k: v['root_sampled_actions'] for k, v in policy_output.items()
-                    }
-
+                    root_sampled_actions_dict_with_env_id = {}
                 if not collect_with_pure_policy:
-                    distributions_dict_with_env_id = {k: v['visit_count_distributions'] for k, v in
-                                                      policy_output.items()}
-                    visit_entropy_dict_with_env_id = {k: v['visit_count_distribution_entropy'] for k, v in
-                                                      policy_output.items()}
-
+                    distributions_dict_with_env_id = {}
+                    visit_entropy_dict_with_env_id = {}
                     if self.policy_config.gumbel_algo:
-                        improved_policy_dict_with_env_id = {k: v['improved_policy_probs'] for k, v in
-                                                            policy_output.items()}
-                        completed_value_with_env_id = {k: v['roots_completed_value'] for k, v in policy_output.items()}
+                        improved_policy_dict_with_env_id = {}
+                        completed_value_with_env_id = {}
+                
+                # 单次遍历提取所有需要的数据
+                for k, v in policy_output.items():
+                    actions_with_env_id[k] = v['action']
+                    value_dict_with_env_id[k] = v['searched_value']
+                    pred_value_dict_with_env_id[k] = v['predicted_value']
+                    timestep_dict_with_env_id[k] = v.get('timestep', -1)
+                    pred_next_text_with_env_id[k] = v.get('predicted_next_text', -1)
+                    
+                    if self.policy_config.sampled_algo:
+                        root_sampled_actions_dict_with_env_id[k] = v['root_sampled_actions']
+                    if not collect_with_pure_policy:
+                        distributions_dict_with_env_id[k] = v['visit_count_distributions']
+                        visit_entropy_dict_with_env_id[k] = v['visit_count_distribution_entropy']
+                        if self.policy_config.gumbel_algo:
+                            improved_policy_dict_with_env_id[k] = v['improved_policy_probs']
+                            completed_value_with_env_id[k] = v['roots_completed_value']
 
                 # Initialize dictionaries to store results
                 actions = {}
