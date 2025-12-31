@@ -356,17 +356,23 @@ class ChineseChessEnv(BaseEnv):
             # | 结局类型 | Termination | 奖励 |
             # | 将死/困毙 | CHECKMATE/STALEMATE | 胜者+1，败者-1 |
             # | 长将 | PERPETUAL_CHECK | 长将方-1（对手胜） |
-            # | 四次重复 | FOURFOLD_REPETITION | 0（和棋） |
+            # | 四次重复 | FOURFOLD_REPETITION | 0（被动和棋，先手已被过滤）|
             # | 子力不足 | INSUFFICIENT_MATERIAL | 0（和棋） |
             # | 60回合无吃子 | SIXTY_MOVES | 0（和棋） |
             # | 最大步数 | MaxSteps | 0（和棋） |
             # ============================================
+            # 
+            # 重复处理策略：
+            # - 过滤会导致"第3次重复"的动作（阻止先手进入循环）
+            # - 被迫重复（所有动作都被过滤）= 和棋 0 分
+            # ============================================
             
             if outcome is not None:
                 if outcome.termination == cchess.Termination.FOURFOLD_REPETITION:
-                    # 四次重复：和棋 0 分（零和博弈）
+                    # 四次重复：触发者是被动方（先手动作已被过滤）
+                    # 被迫走重复棋，不惩罚
                     reward_scalar = 0.0
-                    logging.info(f"[ENV] 四次重复和棋! ActingPlayer: {acting_player}, Steps: {self.current_step}")
+                    logging.info(f"[ENV] 四次重复(被动和棋)! ActingPlayer: {acting_player}, Steps: {self.current_step}")
                 
                 elif outcome.termination in [cchess.Termination.INSUFFICIENT_MATERIAL, 
                                               cchess.Termination.SIXTY_MOVES]:
@@ -566,18 +572,51 @@ class ChineseChessEnv(BaseEnv):
         """
         返回所有合法动作的索引列表
         
-        直接返回棋盘的合法动作，不进行翻转。
+        过滤掉会导致三次重复的动作（阻止"先手"进入重复循环）。
+        这样被动方就不会被迫走第四次重复。
         """
         legal_actions_list = []
         for move in self.board.legal_moves:
             key = (move.from_square, move.to_square)
             if key in MOVE_TO_ACTION:
+                # 检查这步棋是否会导致三次重复（先手过滤）
+                if self._would_cause_repetition(move):
+                    continue  # 跳过会导致重复的动作
                 action = MOVE_TO_ACTION[key]
                 legal_actions_list.append(action)
             else:
                 # 这不应该发生，但为了安全起见记录警告
                 logging.warning(f"移动 {key} 不在映射表中，跳过")
+        
+        # 如果过滤后没有合法动作了，说明只能走重复棋，此时返回所有合法动作
+        if not legal_actions_list:
+            for move in self.board.legal_moves:
+                key = (move.from_square, move.to_square)
+                if key in MOVE_TO_ACTION:
+                    legal_actions_list.append(MOVE_TO_ACTION[key])
+        
         return legal_actions_list
+    
+    def _would_cause_repetition(self, move: 'cchess.Move') -> bool:
+        """
+        检查执行这步棋后是否会导致三次重复（提前过滤先手）
+        
+        逻辑：如果走完后局面出现第3次，说明当前玩家是"先手"进入重复循环，
+        应该被过滤。这样被动方就不会被迫走第4次重复。
+        
+        Args:
+            move: 要检查的移动
+            
+        Returns:
+            True 如果会导致三次重复，False 否则
+        """
+        # 临时执行移动
+        self.board.push(move)
+        # 检查是否会导致三次重复（提前阻止先手进入循环）
+        would_repeat = self.board.is_repetition(3)
+        # 撤销移动
+        self.board.pop()
+        return would_repeat
 
     def get_done_winner(self) -> Tuple[bool, int]:
         """检查游戏是否结束并返回胜者"""
