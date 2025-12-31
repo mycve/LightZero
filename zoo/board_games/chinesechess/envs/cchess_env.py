@@ -64,45 +64,32 @@ def action_to_move(action: int) -> cchess.Move:
 @ENV_REGISTRY.register('cchess')
 class ChineseChessEnv(BaseEnv):
     """
-    中国象棋环境（重构版，统一红方视角）
+    中国象棋环境（与五子棋等游戏保持一致的设计）
     
     主要特性：
     - 动作空间：2238（压缩后的合法移动）
-    - 观察空间：(68, 10, 9) = 17层(14棋子+3特征) * 4历史帧
-    - **统一红方视角**：无论红方还是黑方行动，模型看到的都是相同视角
+    - 观察空间：(72, 10, 9) = 18层(14棋子+4特征) * 4历史帧
+    - 己方优先编码：当前玩家的棋子在前7层，对手的棋子在后7层
     
-    ===================== 统一红方视角设计 =====================
+    ===================== 观测设计 =====================
     
-    核心思想：模型只需要学习"己方在下，向上进攻"这一种策略。
+    与五子棋等游戏保持一致的设计：
+    - 棋盘不翻转，始终是同一个物理视角
+    - 通过"己方/对方"编码来区分棋子归属
+    - MuZero 的 dynamics 模型可以学习连续的状态转移
     
-    实现方式：
-    1. 观测空间：
-       - 红方行动：正常视角，红方棋子在下方 (row 0-4)
-       - 黑方行动：棋盘180°翻转，翻转后黑方棋子也在下方
-       - 己方棋子始终在前7层 (通道 0-6)，对方棋子在后7层 (通道 7-13)
-    
-    2. 动作空间：
-       - 所有动作都是"红方视角的动作"
-       - 黑方行动时，环境自动将动作翻转回真实动作执行
-       - 翻转公式：square → 89 - square (180° 旋转)
-    
-    3. 合法动作：
-       - 红方行动：直接返回合法动作
-       - 黑方行动：将合法动作翻转到红方视角后返回
-    
-    优点：
-    - 策略共享：模型只学习一种策略，大大降低学习难度
-    - 样本效率：红方/黑方的训练数据可以互相利用
-    - 符合 AlphaZero 论文的标准做法
+    注意：不使用统一红方视角（棋盘翻转），因为这会破坏
+    MuZero dynamics 模型的 latent state 连续性！
     
     ==========================================================
     
-    特征通道（每帧17层）：
-    - 0-6层: 己方7种棋子（兵、车、马、炮、士、象、将）
-    - 7-13层: 对方7种棋子
-    - 14层: 重复计数 / 4.0（提醒模型避免重复）
-    - 15层: 步数计数 / 最大步数（提醒模型注意步数限制）
-    - 16层: 限着计数 / 120.0（提醒模型注意吃子，60回合无吃子判和）
+    特征通道（每帧18层）：
+    - 0-6层: 当前玩家的7种棋子（兵、车、马、炮、士、象、将）
+    - 7-13层: 对手的7种棋子
+    - 14层: 当前玩家指示 / 2.0（关键！让模型知道谁在下棋，与五子棋一致）
+    - 15层: 重复计数 / 4.0（提醒模型避免重复）
+    - 16层: 步数计数 / 最大步数（提醒模型注意步数限制）
+    - 17层: 限着计数 / 120.0（提醒模型注意吃子，60回合无吃子判和）
     
     注：长将、子力不足由环境直接判断对局结束，不作为观察特征
     """
@@ -122,7 +109,6 @@ class ChineseChessEnv(BaseEnv):
         scale=False,
         stop_value=2,
         max_episode_steps=200,  # 最大回合数限制，防止无限回合
-        draw_as_loss=True,  # 和棋判双方都输（鼓励进攻）
     )
 
     @classmethod
@@ -166,9 +152,6 @@ class ChineseChessEnv(BaseEnv):
         self.max_episode_steps = cfg.max_episode_steps
         self.current_step = 0
         
-        # 和棋策略：True 表示和棋判双方都输（鼓励进攻）
-        self.draw_as_loss = cfg.get('draw_as_loss', True)
-        
         # 渲染相关
         self.frames = []  # 用于保存渲染帧
         self.move_history = []  # 用于 HTML 回放
@@ -194,9 +177,9 @@ class ChineseChessEnv(BaseEnv):
         # 初始化动作空间和观察空间（在 reset 之前需要可访问）
         self._action_space = spaces.Discrete(ACTION_SPACE_SIZE)
         self._reward_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
-        # 观察空间：(17 * stack, 10, 9) = (68, 10, 9)
-        # 每帧17层 = 14层棋子 + 3层特征（重复计数、步数、限着）
-        obs_channels = 17 * self.stack_obs_num  # 68
+        # 观察空间：(18 * stack, 10, 9) = (72, 10, 9)
+        # 每帧18层 = 14层棋子 + 4层特征（当前玩家、重复计数、步数、限着）
+        obs_channels = 18 * self.stack_obs_num  # 72
         self._observation_space = spaces.Dict(
             {
                 "observation": spaces.Box(low=0, high=1, shape=(obs_channels, 10, 9), dtype=np.float32),
@@ -244,85 +227,63 @@ class ChineseChessEnv(BaseEnv):
     
     def _get_feature_planes(self) -> np.ndarray:
         """
-        获取 3 个特征通道
+        获取 4 个特征通道
         
         Returns:
-            shape (3, 10, 9) 的数组，每层是一个标量值填充的平面
-            - 通道0: 重复计数 / 4.0（归一化到0~1，提醒模型避免重复）
-            - 通道1: 步数计数 / max_episode_steps（归一化到0~1，提醒模型注意步数限制）
-            - 通道2: 限着计数 / 120.0（halfmove_clock，提醒模型注意吃子）
+            shape (4, 10, 9) 的数组，每层是一个标量值填充的平面
+            - 通道0: 当前玩家指示（1=红方，2=黑方）/ 2.0（与五子棋一致！让模型知道谁在下棋）
+            - 通道1: 重复计数 / 4.0（归一化到0~1，提醒模型避免重复）
+            - 通道2: 步数计数 / max_episode_steps（归一化到0~1，提醒模型注意步数限制）
+            - 通道3: 限着计数 / 120.0（halfmove_clock，提醒模型注意吃子）
         
         注：长将、子力不足由环境直接判断对局结束，不作为观察特征
         """
-        planes = np.zeros((3, 10, 9), dtype=np.float32)
+        planes = np.zeros((4, 10, 9), dtype=np.float32)
         
-        # 通道0: 重复计数（归一化，4次重复判和/负）
+        # 通道0: 当前玩家指示（关键！让模型知道谁在下棋）
+        # 与五子棋的 board_to_play 层一致
+        planes[0] = self._current_player / 2.0  # 1/2=0.5 或 2/2=1.0
+        
+        # 通道1: 重复计数（归一化，4次重复判和/负）
         repetition_count = self._count_repetition()
-        planes[0] = min(repetition_count / 4.0, 1.0)
+        planes[1] = min(repetition_count / 4.0, 1.0)
         
-        # 通道1: 步数计数（归一化）
-        planes[1] = min(self.current_step / self.max_episode_steps, 1.0)
+        # 通道2: 步数计数（归一化）
+        planes[2] = min(self.current_step / self.max_episode_steps, 1.0)
         
-        # 通道2: 限着计数（halfmove_clock / 120，60回合=120半回合判和）
-        planes[2] = min(self.board.halfmove_clock / 120.0, 1.0)
+        # 通道3: 限着计数（halfmove_clock / 120，60回合=120半回合判和）
+        planes[3] = min(self.board.halfmove_clock / 120.0, 1.0)
         
         return planes
     
-    def _flip_square(self, square: int) -> int:
-        """
-        翻转格子坐标（180°旋转）
-        
-        棋盘是 10行×9列，共90格 (0-89)
-        square = row * 9 + col
-        翻转后: (9-row) * 9 + (8-col) = 89 - square
-        """
-        return 89 - square
-    
-    def _flip_action(self, action: int) -> int:
-        """
-        翻转动作（用于黑方视角转换）
-        
-        将"红方视角的动作"转换为"真实动作"，或反过来。
-        """
-        from_sq, to_sq = _action_to_move(action)
-        flipped_from = self._flip_square(from_sq)
-        flipped_to = self._flip_square(to_sq)
-        return _move_to_action(flipped_from, flipped_to)
-    
     def _get_canonical_planes(self) -> np.ndarray:
         """
-        获取统一红方视角的棋盘表示 + 特征通道
+        获取棋盘表示 + 特征通道（己方优先编码，不翻转棋盘）
         
-        核心思想：无论红方还是黑方行动，模型看到的都是"己方在下（row 0-4），
-        向上进攻"的视角。这样模型只需要学习一种策略。
+        重要：不翻转棋盘！与五子棋等游戏保持一致的设计。
+        MuZero 的 dynamics 模型需要 latent state 的连续性，
+        如果每步都翻转棋盘，会破坏这种连续性，导致模型无法学习。
         
-        实现方式：
-        - 红方行动时：正常视角，红方在下
-        - 黑方行动时：棋盘180°翻转，翻转后黑方在下
+        编码方式：
+        - 0-6层: 当前玩家的7种棋子（己方）
+        - 7-13层: 对手的7种棋子（对方）
+        - 14层: 当前玩家指示层（1=红方，2=黑方）/ 2.0（与五子棋一致！）
+        - 15层: 重复计数 / 4.0
+        - 16层: 步数计数 / max_steps
+        - 17层: 限着计数 / 120.0
         
         Returns:
-            shape (17, 10, 9) 的数组
-            - 0-6层: 己方7种棋子（始终在下方 row 0-4 附近）
-            - 7-13层: 对方7种棋子（始终在上方 row 5-9 附近）
-            - 14层: 重复计数
-            - 15层: 步数计数
-            - 16层: 限着计数
+            shape (18, 10, 9) 的数组
         """
         if self._current_player == 1:  # 红方行动
-            # 红方视角：正常，红方在下
             own_planes = self._get_pieces_planes(cchess.RED)
             opp_planes = self._get_pieces_planes(cchess.BLACK)
-            feature_planes = self._get_feature_planes()
-            planes = np.concatenate([own_planes, opp_planes, feature_planes], axis=0)
         else:  # 黑方行动
-            # 黑方视角：先获取正常棋盘，然后180°翻转
             own_planes = self._get_pieces_planes(cchess.BLACK)
             opp_planes = self._get_pieces_planes(cchess.RED)
-            feature_planes = self._get_feature_planes()
-            planes = np.concatenate([own_planes, opp_planes, feature_planes], axis=0)
-            # 180° 翻转棋盘（沿 row 和 col 都翻转）
-            # 翻转后黑方棋子就在下方了
-            planes = np.flip(planes, axis=(1, 2)).copy()
+        
+        feature_planes = self._get_feature_planes()
+        planes = np.concatenate([own_planes, opp_planes, feature_planes], axis=0)
         
         return planes
 
@@ -335,10 +296,8 @@ class ChineseChessEnv(BaseEnv):
         """
         执行一步棋
         
-        注意：输入的 action 是"红方视角的动作"（统一视角）。
-        黑方行动时，需要翻转回"真实动作"才能执行。
         """
-        legal_actions = self.legal_actions  # 这是红方视角的合法动作
+        legal_actions = self.legal_actions
         
         if action not in legal_actions:
             logging.warning(
@@ -350,12 +309,8 @@ class ChineseChessEnv(BaseEnv):
         # 保存执行动作的玩家（用于奖励计算）
         acting_player = self._current_player
         
-        # 黑方行动时，将"红方视角动作"翻转回"真实动作"
-        real_action = action
-        if self._current_player == 2:
-            real_action = self._flip_action(action)
-        
-        move = action_to_move(real_action)
+        # 动作直接使用，不需要翻转（棋盘不翻转，动作也不翻转）
+        move = action_to_move(action)
         
         # 记录移动历史（用于 HTML 回放）
         self.move_history.append({
@@ -540,9 +495,9 @@ class ChineseChessEnv(BaseEnv):
         self._action_space = spaces.Discrete(ACTION_SPACE_SIZE)
         self._reward_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
         
-        # 观察空间：(17 * stack, 10, 9) = (68, 10, 9)
-        # 每帧17层 = 14层棋子 + 3层特征（重复计数、步数、限着）
-        obs_channels = 17 * self.stack_obs_num  # 68
+        # 观察空间：(18 * stack, 10, 9) = (72, 10, 9)
+        # 每帧18层 = 14层棋子 + 4层特征（当前玩家、重复计数、步数、限着）
+        obs_channels = 18 * self.stack_obs_num  # 72
         self._observation_space = spaces.Dict(
             {
                 "observation": spaces.Box(low=0, high=1, shape=(obs_channels, 10, 9), dtype=np.float32),
@@ -559,7 +514,7 @@ class ChineseChessEnv(BaseEnv):
         """
         获取当前堆叠状态（己方优先编码 + 特征通道）
         """
-        # 堆叠历史帧，shape: (17 * stack, 10, 9) = (68, 10, 9)
+        # 堆叠历史帧，shape: (18 * stack, 10, 9) = (72, 10, 9)
         state = np.concatenate(list(self.obs_buffer), axis=0)
         
         if self.scale:
@@ -609,21 +564,15 @@ class ChineseChessEnv(BaseEnv):
     @property
     def legal_actions(self) -> List[int]:
         """
-        返回所有合法动作的索引列表（统一红方视角）
+        返回所有合法动作的索引列表
         
-        - 红方行动时：直接返回合法动作
-        - 黑方行动时：将合法动作翻转到红方视角
-        
-        这样模型看到的动作空间始终是"从红方视角看的动作"。
+        直接返回棋盘的合法动作，不进行翻转。
         """
         legal_actions_list = []
         for move in self.board.legal_moves:
             key = (move.from_square, move.to_square)
             if key in MOVE_TO_ACTION:
                 action = MOVE_TO_ACTION[key]
-                # 黑方行动时，翻转动作到红方视角
-                if self._current_player == 2:
-                    action = self._flip_action(action)
                 legal_actions_list.append(action)
             else:
                 # 这不应该发生，但为了安全起见记录警告
@@ -665,20 +614,13 @@ class ChineseChessEnv(BaseEnv):
         return np.random.choice(self.legal_actions)
     
     def bot_action(self) -> int:
-        """
-        使用UCI引擎或随机策略选择动作
-        
-        返回的是"红方视角的动作"（统一视角）。
-        """
+        """使用UCI引擎或随机策略选择动作"""
         if self.engine is not None:
             try:
                 from .cchess import engine as engine_module
                 limit = engine_module.Limit(depth=self.engine_depth)
                 result = self.engine.play(self.board, limit)
                 action = move_to_action(result.move)
-                # 引擎返回的是真实动作，黑方时需要翻转到红方视角
-                if self._current_player == 2:
-                    action = self._flip_action(action)
                 return action
             except Exception as e:
                 logging.warning(f"引擎调用失败: {e}，使用随机策略")
@@ -687,20 +629,13 @@ class ChineseChessEnv(BaseEnv):
             return self.random_action()
 
     def human_to_action(self) -> int:
-        """
-        从人类输入获取动作
-        
-        返回的是"红方视角的动作"（统一视角）。
-        """
+        """从人类输入获取动作"""
         print(self.board.unicode(axes=True, axes_type=0))
         while True:
             try:
                 uci = input(f"请输入走法（UCI格式，如 h2e2）: ")
                 move = cchess.Move.from_uci(uci)
                 action = move_to_action(move)
-                # 人类输入的是真实动作，黑方时需要翻转到红方视角
-                if self._current_player == 2:
-                    action = self._flip_action(action)
                 if action in self.legal_actions:
                     return action
                 else:
@@ -752,22 +687,14 @@ class ChineseChessEnv(BaseEnv):
         """
         模拟执行动作并返回新的模拟环境（用于 MCTS）
         
-        注意：输入的 action 是"红方视角的动作"（统一视角）。
-        黑方行动时，需要翻转回"真实动作"才能执行。
-        
         关键：必须正确切换 start_player_index，否则 MCTS 价值回传会出错！
         参考五子棋等环境的标准实现。
         """
         if action not in self.legal_actions:
             raise ValueError(f"动作 {action} 不合法")
         
-        # 黑方行动时，将"红方视角动作"翻转回"真实动作"
-        real_action = action
-        if self._current_player == 2:
-            real_action = self._flip_action(action)
-        
-        # 在当前环境上执行动作，获取新的棋盘状态
-        move = action_to_move(real_action)
+        # 动作直接使用，不需要翻转
+        move = action_to_move(action)
         
         # 复制当前环境
         new_env = self.copy()
