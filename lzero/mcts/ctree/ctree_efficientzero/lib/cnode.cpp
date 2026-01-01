@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <map>
 #include <cassert>
+#include <random>
+#include <omp.h>
 
 #ifdef _WIN32
 #include "..\..\common_lib\utils.cpp"
@@ -15,6 +17,11 @@
 
 namespace tree
 {
+    // Helper for thread-safe random number generation
+    std::mt19937& get_rng() {
+        static thread_local std::mt19937 rng(std::random_device{}());
+        return rng;
+    }
 
     CSearchResults::CSearchResults()
     {
@@ -898,11 +905,14 @@ namespace tree
             - virtual_to_play_batch: the batch of which player is playing on this node.
         */
         // set seed
-        get_time_and_set_rand_seed();
+        // get_time_and_set_rand_seed();
 
-        int last_action = -1;
-        float parent_q = 0.0;
-        results.search_lens = std::vector<int>();
+        results.search_lens.resize(results.num);
+        results.latent_state_index_in_search_path.resize(results.num);
+        results.latent_state_index_in_batch.resize(results.num);
+        results.last_actions.resize(results.num);
+        results.nodes.resize(results.num);
+        results.virtual_to_play_batchs.resize(results.num);
 
         int players = 0;
         int largest_element = *max_element(virtual_to_play_batch.begin(), virtual_to_play_batch.end()); // 0 or 2
@@ -915,12 +925,16 @@ namespace tree
             players = 2;
         }
 
+        #pragma omp parallel for
         for (int i = 0; i < results.num; ++i)
         {
             CNode *node = &(roots->roots[i]);
             int is_root = 1;
             int search_len = 0;
             results.search_paths[i].push_back(node);
+
+            int last_action = -1;
+            float parent_q = 0.0;
 
             while (node->expanded())
             {
@@ -952,13 +966,13 @@ namespace tree
 
             CNode *parent = results.search_paths[i][results.search_paths[i].size() - 2];
 
-            results.latent_state_index_in_search_path.push_back(parent->current_latent_state_index);
-            results.latent_state_index_in_batch.push_back(parent->batch_index);
+            results.latent_state_index_in_search_path[i] = parent->current_latent_state_index;
+            results.latent_state_index_in_batch[i] = parent->batch_index;
 
-            results.last_actions.push_back(last_action);
-            results.search_lens.push_back(search_len);
-            results.nodes.push_back(node);
-            results.virtual_to_play_batchs.push_back(virtual_to_play_batch[i]);
+            results.last_actions[i] = last_action;
+            results.search_lens[i] = search_len;
+            results.nodes[i] = node;
+            results.virtual_to_play_batchs[i] = virtual_to_play_batch[i];
         }
     }
 
