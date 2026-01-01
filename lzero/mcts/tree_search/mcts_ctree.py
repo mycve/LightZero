@@ -1,7 +1,5 @@
 import copy
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, List, Any, Union, Tuple
+from typing import TYPE_CHECKING, List, Any, Union
 
 import numpy as np
 import torch
@@ -195,13 +193,9 @@ class MuZeroMCTSCtree(object):
     """
     Overview:
         MCTSCtree for MuZero. The core ``batch_traverse`` and ``batch_backpropagate`` function is implemented in C++.
-        
-        支持两种搜索模式：
-        1. search(): 传统串行搜索，一个线程处理所有环境
-        2. search_parallel(): 流水线并行搜索，多Worker并行执行CPU操作，共享GPU推理
 
     Interfaces:
-        __init__, roots, search, search_parallel
+        __init__, roots, search
     """
 
     config = dict(
@@ -238,9 +232,6 @@ class MuZeroMCTSCtree(object):
         self.reward_support = DiscreteSupport(*self._cfg.model.reward_support_range, self._cfg.device)
         self.value_inverse_scalar_transform_handle = InverseScalarTransform(self.value_support, self._cfg.model.categorical_distribution)
         self.reward_inverse_scalar_transform_handle = InverseScalarTransform(self.reward_support, self._cfg.model.categorical_distribution)
-        
-        # GPU推理锁，用于多Worker并行搜索时保护GPU推理串行执行
-        self._gpu_lock = threading.Lock()
 
     @classmethod
     def roots(cls: int, active_collect_env_num: int, legal_actions: List[Any]) -> "mz_ctree":
@@ -349,183 +340,6 @@ class MuZeroMCTSCtree(object):
                     current_latent_state_index, discount_factor, reward_batch, value_batch, policy_logits_batch,
                     min_max_stats_lst, results, virtual_to_play_batch
                 )
-
-    def _gpu_inference(
-            self, 
-            model: torch.nn.Module, 
-            latent_states: np.ndarray, 
-            actions: np.ndarray
-    ) -> dict:
-        """
-        Overview:
-            执行GPU推理（线程安全）。通过锁保证同一时刻只有一个线程在执行GPU推理。
-        Arguments:
-            - model: 神经网络模型
-            - latent_states: 潜在状态 numpy数组
-            - actions: 动作 numpy数组
-        Returns:
-            - 推理结果字典，包含 latent_state, policy_logits, value, reward
-        """
-        with self._gpu_lock:
-            with torch.no_grad():
-                states_t = torch.from_numpy(latent_states).to(self._cfg.device)
-                actions_t = torch.from_numpy(actions).to(self._cfg.device).long()
-                
-                network_output = model.recurrent_inference(states_t, actions_t)
-                
-                return {
-                    'latent_state': to_detach_cpu_numpy(network_output.latent_state),
-                    'policy_logits': to_detach_cpu_numpy(network_output.policy_logits),
-                    'value': to_detach_cpu_numpy(
-                        self.value_inverse_scalar_transform_handle(network_output.value)
-                    ),
-                    'reward': to_detach_cpu_numpy(
-                        self.reward_inverse_scalar_transform_handle(network_output.reward)
-                    ),
-                }
-
-    def _worker_search(
-            self,
-            roots: Any,
-            model: torch.nn.Module,
-            latent_state_roots: np.ndarray,
-            to_play_batch: List[int]
-    ) -> None:
-        """
-        Overview:
-            单个Worker的搜索逻辑，在独立线程中运行。
-            执行完整的MCTS搜索循环：Selection -> Expansion -> Backup
-        Arguments:
-            - roots: 根节点集合
-            - model: 神经网络模型（共享）
-            - latent_state_roots: 初始潜在状态
-            - to_play_batch: 玩家信息
-        """
-        batch_size = roots.num
-        cfg = self._cfg
-        pb_c_base, pb_c_init, discount_factor = cfg.pb_c_base, cfg.pb_c_init, cfg.discount_factor
-        
-        latent_state_batch_in_search_path = [latent_state_roots]
-        min_max_stats_lst = tree_muzero.MinMaxStatsList(batch_size)
-        min_max_stats_lst.set_delta(cfg.value_delta_max)
-        
-        for simulation_index in range(cfg.num_simulations):
-            # ============ Stage 1: Selection (CPU - 可并行) ============
-            results = tree_muzero.ResultsWrapper(num=batch_size)
-            
-            if cfg.env_type == 'not_board_games':
-                latent_state_index_in_search_path, latent_state_index_in_batch, \
-                last_actions, virtual_to_play_batch = tree_muzero.batch_traverse(
-                    roots, pb_c_base, pb_c_init, discount_factor,
-                    min_max_stats_lst, results, to_play_batch
-                )
-            else:
-                latent_state_index_in_search_path, latent_state_index_in_batch, \
-                last_actions, virtual_to_play_batch = tree_muzero.batch_traverse(
-                    roots, pb_c_base, pb_c_init, discount_factor,
-                    min_max_stats_lst, results, copy.deepcopy(to_play_batch)
-                )
-            
-            # 收集叶子节点状态
-            latent_states = []
-            for ix, iy in zip(latent_state_index_in_search_path, latent_state_index_in_batch):
-                latent_states.append(latent_state_batch_in_search_path[ix][iy])
-            
-            latent_states = np.asarray(latent_states)
-            last_actions = np.asarray(last_actions)
-            
-            # ============ Stage 2: Expansion (GPU - 通过锁串行) ============
-            network_output = self._gpu_inference(model, latent_states, last_actions)
-            
-            latent_state_batch_in_search_path.append(network_output['latent_state'])
-            
-            # ============ Stage 3: Backup (CPU - 可并行) ============
-            reward_batch = network_output['reward'].reshape(-1).tolist()
-            value_batch = network_output['value'].reshape(-1).tolist()
-            policy_logits_batch = network_output['policy_logits'].tolist()
-            
-            current_latent_state_index = simulation_index + 1
-            tree_muzero.batch_backpropagate(
-                current_latent_state_index, discount_factor,
-                reward_batch, value_batch, policy_logits_batch,
-                min_max_stats_lst, results, virtual_to_play_batch
-            )
-
-    def search_parallel(
-            self,
-            roots_list: List[Any],
-            model: torch.nn.Module,
-            latent_states_list: List[np.ndarray],
-            to_play_list: List[List[int]],
-            num_workers: int = None
-    ) -> List[Any]:
-        """
-        Overview:
-            流水线并行MCTS搜索。将环境分成多组，每组由一个Worker处理，多个Worker并行执行。
-            
-            架构：
-            - 多个CPU Worker并行执行树搜索（traverse/backprop）
-            - 单GPU队列串行处理推理请求（通过锁保护）
-            - 模型只加载一份，不额外占用显存
-            
-            时序示意：
-                Worker1: [Trav]──[等GPU]──[Back]──[Trav]──...
-                Worker2:    [Trav]──[等GPU]──[Back]──[Trav]──...
-                Worker3:       [Trav]──[等GPU]──[Back]──...
-                GPU:     [===1===][===2===][===3===][===1===]...
-                
-        Arguments:
-            - roots_list: 每个Worker的根节点集合列表
-            - model: 神经网络模型（共享）
-            - latent_states_list: 每个Worker的初始潜在状态列表
-            - to_play_list: 每个Worker的玩家信息列表
-            - num_workers: Worker数量，默认为roots_list长度
-            
-        Returns:
-            - roots_list: 搜索完成后的根节点列表
-            
-        Example:
-            >>> # 128个环境拆分成4个Worker，每个处理32个
-            >>> num_workers = 4
-            >>> envs_per_worker = 32
-            >>> roots_list, states_list, to_play_list = [], [], []
-            >>> for i in range(num_workers):
-            >>>     start, end = i * envs_per_worker, (i + 1) * envs_per_worker
-            >>>     roots = tree_muzero.Roots(envs_per_worker, legal_actions[start:end])
-            >>>     roots.prepare(noise_weight, noises[start:end], rewards[start:end], 
-            >>>                   policies[start:end], to_play[start:end])
-            >>>     roots_list.append(roots)
-            >>>     states_list.append(latent_states[start:end])
-            >>>     to_play_list.append(to_play[start:end])
-            >>> mcts.search_parallel(roots_list, model, states_list, to_play_list)
-        """
-        if num_workers is None:
-            num_workers = len(roots_list)
-        
-        assert len(roots_list) == len(latent_states_list) == len(to_play_list), \
-            "roots_list, latent_states_list, to_play_list 长度必须相同"
-        
-        with torch.no_grad():
-            model.eval()
-            
-            # 使用线程池并行执行搜索
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = []
-                for worker_id in range(len(roots_list)):
-                    future = executor.submit(
-                        self._worker_search,
-                        roots_list[worker_id],
-                        model,
-                        latent_states_list[worker_id],
-                        to_play_list[worker_id]
-                    )
-                    futures.append(future)
-                
-                # 等待所有Worker完成
-                for future in futures:
-                    future.result()
-        
-        return roots_list
 
     def search_with_reuse(
             self,
