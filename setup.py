@@ -51,26 +51,12 @@ extra_link_args = []
 
 if sys.platform == 'win32':
     # Use the VS compiler on Windows platform
-    extra_compile_args = ["/std:c++11", "/openmp"]
+    extra_compile_args = ["/std:c++11"]
     extra_link_args = ["/std:c++11"]
-elif sys.platform == 'darwin':
-    # macOS Platform
-    extra_compile_args = ["-std=c++11", "-Xpreprocessor", "-fopenmp"]
-    extra_link_args = ["-std=c++11", "-lomp"]
-    # Check for homebrew libomp installation
-    omp_paths = [
-        '/opt/homebrew/opt/libomp',
-        '/usr/local/opt/libomp',
-    ]
-    for omp_path in omp_paths:
-        if os.path.exists(omp_path):
-            include_dirs.append(os.path.join(omp_path, 'include'))
-            extra_link_args.append(f'-L{os.path.join(omp_path, "lib")}')
-            break
 else:
-    # Linux Platform
-    extra_compile_args = ["-std=c++11", "-fopenmp"]
-    extra_link_args = ["-std=c++11", "-fopenmp"]
+    # Linux/macOS Platform
+    extra_compile_args = ["-std=c++11"]
+    extra_link_args = ["-std=c++11"]
 
 
 def find_pyx(path=None):
