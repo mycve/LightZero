@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <map>
 #include <cassert>
+#include <random>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef _WIN32
 #include "..\..\common_lib\utils.cpp"
@@ -15,6 +19,12 @@
 
 namespace tree
 {
+    // 线程安全随机数：替代 rand()/srand()（它们在多线程下不安全）
+    static std::mt19937 &get_rng()
+    {
+        static thread_local std::mt19937 rng(std::random_device{}());
+        return rng;
+    }
 
     CSearchResults::CSearchResults()
     {
@@ -590,6 +600,9 @@ namespace tree
             - is_reset_list: the vector of is_reset nodes along the search path, where is_reset represents for whether the parent value prefix needs to be reset.
             - to_play_batch: the batch of which player is playing on this node.
         */
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
         for (int i = 0; i < results.num; ++i)
         {
             results.nodes[i]->expand(to_play_batch[i], current_latent_state_index, i, value_prefixs[i], policies[i]);
@@ -688,7 +701,8 @@ namespace tree
         int action = 0;
         if (max_index_lst.size() > 0)
         {
-            int rand_index = rand() % max_index_lst.size();
+            std::uniform_int_distribution<int> dist(0, static_cast<int>(max_index_lst.size()) - 1);
+            int rand_index = dist(get_rng());
             action = max_index_lst[rand_index];
         }
         return action;
@@ -746,7 +760,8 @@ namespace tree
         int action = 0;
         if (max_index_lst.size() > 0)
         {
-            int rand_index = rand() % max_index_lst.size();
+            std::uniform_int_distribution<int> dist(0, static_cast<int>(max_index_lst.size()) - 1);
+            int rand_index = dist(get_rng());
             action = max_index_lst[rand_index];
         }
         // printf("select root child ends");
@@ -897,12 +912,22 @@ namespace tree
             - results: the search results.
             - virtual_to_play_batch: the batch of which player is playing on this node.
         */
-        // set seed
-        get_time_and_set_rand_seed();
+        // NOTE:
+        // - 该函数可安全地按 batch root 并行（每个 i 对应独立一棵树）
+        // - 禁止使用 rand()/srand()：多线程下不安全。这里的随机选择已改为 thread_local RNG。
 
-        int last_action = -1;
-        float parent_q = 0.0;
-        results.search_lens = std::vector<int>();
+        results.search_lens.clear();
+        results.search_lens.resize(results.num);
+        results.latent_state_index_in_search_path.clear();
+        results.latent_state_index_in_search_path.resize(results.num);
+        results.latent_state_index_in_batch.clear();
+        results.latent_state_index_in_batch.resize(results.num);
+        results.last_actions.clear();
+        results.last_actions.resize(results.num);
+        results.nodes.clear();
+        results.nodes.resize(results.num);
+        results.virtual_to_play_batchs.clear();
+        results.virtual_to_play_batchs.resize(results.num);
 
         int players = 0;
         int largest_element = *max_element(virtual_to_play_batch.begin(), virtual_to_play_batch.end()); // 0 or 2
@@ -915,11 +940,18 @@ namespace tree
             players = 2;
         }
 
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
         for (int i = 0; i < results.num; ++i)
         {
+            int last_action = -1;
+            float parent_q = 0.0;
+
             CNode *node = &(roots->roots[i]);
             int is_root = 1;
             int search_len = 0;
+            results.search_paths[i].clear();
             results.search_paths[i].push_back(node);
 
             while (node->expanded())
@@ -952,13 +984,12 @@ namespace tree
 
             CNode *parent = results.search_paths[i][results.search_paths[i].size() - 2];
 
-            results.latent_state_index_in_search_path.push_back(parent->current_latent_state_index);
-            results.latent_state_index_in_batch.push_back(parent->batch_index);
-
-            results.last_actions.push_back(last_action);
-            results.search_lens.push_back(search_len);
-            results.nodes.push_back(node);
-            results.virtual_to_play_batchs.push_back(virtual_to_play_batch[i]);
+            results.latent_state_index_in_search_path[i] = parent->current_latent_state_index;
+            results.latent_state_index_in_batch[i] = parent->batch_index;
+            results.last_actions[i] = last_action;
+            results.search_lens[i] = search_len;
+            results.nodes[i] = node;
+            results.virtual_to_play_batchs[i] = virtual_to_play_batch[i];
         }
     }
 
@@ -978,8 +1009,7 @@ namespace tree
             - true_action: the action chosen in the trajectory.
             - reuse_value: the value obtained from the search of the next state in the trajectory.
         */
-        // set seed
-        get_time_and_set_rand_seed();
+        // NOTE: 不再依赖 rand()/srand()，避免多线程不安全问题（已改为 thread_local RNG）。
 
         int last_action = -1;
         float parent_q = 0.0;

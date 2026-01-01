@@ -6,7 +6,9 @@
 #include <map>
 #include <cassert>
 #include <random>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 
 #ifdef _WIN32
 #include "..\..\common_lib\utils.cpp"
